@@ -53,6 +53,10 @@ type PerconaPGCluster struct {
 
 // +kubebuilder:validation:XValidation:rule="!has(self.extensions) || !has(self.extensions.pg_tde) || !has(self.extensions.pg_tde.enabled) || !self.extensions.pg_tde.enabled || self.postgresVersion >= 17",message="pg_tde is only supported for PG17 and above"
 // +kubebuilder:validation:XValidation:rule="!has(self.users) || self.postgresVersion >= 15 || self.users.all(u, !has(u.grantPublicSchemaAccess) || !u.grantPublicSchemaAccess)",message="PostgresVersion must be >= 15 if grantPublicSchemaAccess exists and is true"
+// The DCS rule is written against the whole spec, not against
+// spec.patroni.dcs, so that it still runs when either object omits the
+// optional "patroni" or "dcs" sections.
+// +kubebuilder:validation:XValidation:rule="(has(oldSelf.patroni) && has(oldSelf.patroni.dcs) ? oldSelf.patroni.dcs.type : 'kubernetes') == (has(self.patroni) && has(self.patroni.dcs) ? self.patroni.dcs.type : 'kubernetes')",message="spec.patroni.dcs.type is immutable after cluster creation"
 type PerconaPGClusterSpec struct {
 	// +optional
 	Metadata *crunchyv1beta1.Metadata `json:"metadata,omitempty"`
@@ -1572,6 +1576,35 @@ var EnvFromSecretsIndexerFunc client.IndexerFunc = func(obj client.Object) []str
 		return nil
 	}
 	return cr.EnvFromSecrets()
+}
+
+// IndexFieldPatroniEtcdSecrets is the field index name for Secrets referenced
+// by spec.patroni.dcs.etcd (tlsSecret and authSecret).
+const IndexFieldPatroniEtcdSecrets = "pgCluster.patroniEtcdSecrets" //nolint:gosec
+
+// PatroniEtcdSecretsIndexerFunc returns the names of Secrets referenced by the
+// etcd DCS configuration, so that changes to them trigger a reconcile.
+var PatroniEtcdSecretsIndexerFunc client.IndexerFunc = func(obj client.Object) []string {
+	cr, ok := obj.(*PerconaPGCluster)
+	if !ok {
+		return nil
+	}
+	if cr.Spec.Patroni.DCSType() != crunchyv1beta1.PatroniDCSTypeEtcd {
+		return nil
+	}
+	dcs := cr.Spec.Patroni.GetDCS()
+	if dcs == nil || dcs.Etcd == nil {
+		return nil
+	}
+
+	var names []string
+	if dcs.Etcd.TLSSecret != "" {
+		names = append(names, dcs.Etcd.TLSSecret)
+	}
+	if dcs.Etcd.AuthSecret != "" {
+		names = append(names, dcs.Etcd.AuthSecret)
+	}
+	return names
 }
 
 func (cr *PerconaPGCluster) PGBouncerUserSecrets() []string {

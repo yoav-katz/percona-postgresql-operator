@@ -12,6 +12,7 @@ import (
 	"gotest.tools/v3/assert"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -44,7 +45,7 @@ func TestKubernetesEndpointsInstanceYAML(t *testing.T) {
 	assert.Assert(t, dcsYAML == nil)
 }
 
-func TestKubernetesEndpointsInstanceEnvVars(t *testing.T) {
+func TestKubernetesEndpointsPodAdditions(t *testing.T) {
 	leaderService := new(corev1.Service)
 	leaderService.Spec.Ports = []corev1.ServicePort{{Name: "postgres"}}
 	leaderService.Spec.Ports[0].TargetPort.StrVal = "postgres"
@@ -53,9 +54,11 @@ func TestKubernetesEndpointsInstanceEnvVars(t *testing.T) {
 		Name: "postgres", ContainerPort: 9999, Protocol: corev1.ProtocolTCP,
 	}}
 
-	vars := (kubernetesEndpointsBackend{}).InstanceEnvVars(new(v1beta1.PostgresCluster), leaderService, containers)
+	additions := (kubernetesEndpointsBackend{}).PodAdditions(new(v1beta1.PostgresCluster), leaderService, containers)
 
-	assert.Assert(t, cmp.MarshalMatches(vars, `
+	assert.Assert(t, len(additions.Volumes) == 0, "the Kubernetes backend mounts nothing")
+	assert.Assert(t, len(additions.VolumeMounts) == 0)
+	assert.Assert(t, cmp.MarshalMatches(additions.EnvVars, `
 - name: PATRONI_KUBERNETES_POD_IP
   valueFrom:
     fieldRef:
@@ -166,7 +169,7 @@ kind: Service
 	}
 
 	t.Run("NoServiceSpec", func(t *testing.T) {
-		service, err := (kubernetesEndpointsBackend{}).LeaderLeaseService(cluster, new(record.FakeRecorder))
+		service, err := (kubernetesEndpointsBackend{}).LeaderService(cluster, new(record.FakeRecorder))
 		assert.NilError(t, err)
 		alwaysExpect(t, service)
 		// Defaults to ClusterIP.
@@ -186,7 +189,7 @@ kind: Service
 			Labels:      map[string]string{"b": "v2"},
 		}
 
-		service, err := (kubernetesEndpointsBackend{}).LeaderLeaseService(cluster, new(record.FakeRecorder))
+		service, err := (kubernetesEndpointsBackend{}).LeaderService(cluster, new(record.FakeRecorder))
 		assert.NilError(t, err)
 
 		assert.DeepEqual(t, service.Annotations, map[string]string{
@@ -207,7 +210,7 @@ kind: Service
 			},
 		}
 
-		service, err = (kubernetesEndpointsBackend{}).LeaderLeaseService(cluster, new(record.FakeRecorder))
+		service, err = (kubernetesEndpointsBackend{}).LeaderService(cluster, new(record.FakeRecorder))
 		assert.NilError(t, err)
 
 		assert.DeepEqual(t, service.Annotations, map[string]string{
@@ -242,7 +245,7 @@ kind: Service
 			cluster := cluster.DeepCopy()
 			cluster.Spec.Service = &v1beta1.ServiceSpec{Type: test.Type}
 
-			service, err := (kubernetesEndpointsBackend{}).LeaderLeaseService(cluster, new(record.FakeRecorder))
+			service, err := (kubernetesEndpointsBackend{}).LeaderService(cluster, new(record.FakeRecorder))
 			assert.NilError(t, err)
 			alwaysExpect(t, service)
 			test.Expect(t, service)
@@ -293,7 +296,7 @@ kind: Service
 			cluster := cluster.DeepCopy()
 			cluster.Spec.Service = &v1beta1.ServiceSpec{Type: test.Type, NodePort: test.NodePort}
 
-			service, err := (kubernetesEndpointsBackend{}).LeaderLeaseService(cluster, new(record.FakeRecorder))
+			service, err := (kubernetesEndpointsBackend{}).LeaderService(cluster, new(record.FakeRecorder))
 			test.Expect(t, service, err)
 		})
 	}
@@ -349,17 +352,17 @@ func TestKubernetesEndpointsObserve(t *testing.T) {
 	cluster.Name = "observe-test"
 
 	t.Run("NotFound, not ready", func(t *testing.T) {
-		observation, err := (kubernetesEndpointsBackend{}).Observe(ctx, cc, cluster, false)
+		observation, err := (kubernetesEndpointsBackend{}).Observe(ctx, cc, cluster, false, nil, nil)
 		assert.NilError(t, err)
 		assert.Equal(t, observation.SystemIdentifier, "")
-		assert.Equal(t, observation.RequeueAfter, time.Duration(0))
+		assert.Equal(t, observation.RetryAfter, time.Duration(0))
 	})
 
 	t.Run("NotFound, ready", func(t *testing.T) {
-		observation, err := (kubernetesEndpointsBackend{}).Observe(ctx, cc, cluster, true)
+		observation, err := (kubernetesEndpointsBackend{}).Observe(ctx, cc, cluster, true, nil, nil)
 		assert.NilError(t, err)
 		assert.Equal(t, observation.SystemIdentifier, "")
-		assert.Equal(t, observation.RequeueAfter, time.Second)
+		assert.Equal(t, observation.RetryAfter, time.Second)
 	})
 
 	t.Run("initialize annotation present", func(t *testing.T) {
@@ -368,10 +371,10 @@ func TestKubernetesEndpointsObserve(t *testing.T) {
 		assert.NilError(t, cc.Create(ctx, endpoints))
 		t.Cleanup(func() { assert.Check(t, client.IgnoreNotFound(cc.Delete(ctx, endpoints))) })
 
-		observation, err := (kubernetesEndpointsBackend{}).Observe(ctx, cc, cluster, false)
+		observation, err := (kubernetesEndpointsBackend{}).Observe(ctx, cc, cluster, false, nil, nil)
 		assert.NilError(t, err)
 		assert.Equal(t, observation.SystemIdentifier, "123456")
-		assert.Equal(t, observation.RequeueAfter, time.Duration(0))
+		assert.Equal(t, observation.RetryAfter, time.Duration(0))
 	})
 }
 
@@ -392,8 +395,62 @@ func TestKubernetesEndpointsDelete(t *testing.T) {
 	}
 	assert.NilError(t, cc.Create(ctx, endpoints))
 
-	assert.NilError(t, (kubernetesEndpointsBackend{}).Delete(ctx, cc, cluster))
+	cleanup, err := (kubernetesEndpointsBackend{}).Delete(ctx, cc, cluster)
+	assert.NilError(t, err)
+	assert.Assert(t, cleanup.Cleared, "DeleteAllOf is synchronous; nothing to wait for")
+	assert.Assert(t, cleanup.Apply == nil)
+	assert.Assert(t, len(cleanup.Delete) == 0)
 
-	err := cc.Get(ctx, client.ObjectKeyFromObject(endpoints), endpoints)
+	err = cc.Get(ctx, client.ObjectKeyFromObject(endpoints), endpoints)
 	assert.Assert(t, apierrors.IsNotFound(err), "expected the Endpoints to be deleted, got %v", err)
+}
+
+// TestKubernetesEndpointsClearState covers the Endpoints teardown that used to
+// live inline in the pgBackRest restore path.
+func TestKubernetesEndpointsClearState(t *testing.T) {
+	_, cc := require.Kubernetes2(t)
+	require.ParallelCapacity(t, 0)
+	ns := require.Namespace(t, cc)
+	ctx := context.Background()
+
+	cluster := new(v1beta1.PostgresCluster)
+	cluster.Namespace = ns.Name
+	cluster.Name = "clear-state-test"
+
+	t.Run("nothing to clear", func(t *testing.T) {
+		cleanup, err := (kubernetesEndpointsBackend{}).ClearState(ctx, cc, cluster, "some-restore")
+		assert.NilError(t, err)
+		assert.Assert(t, cleanup.Cleared)
+		assert.Assert(t, len(cleanup.Delete) == 0)
+	})
+
+	t.Run("reports every Patroni Endpoints for deletion", func(t *testing.T) {
+		for _, meta := range []metav1.ObjectMeta{
+			naming.PatroniLeaderEndpoints(cluster),
+			naming.PatroniDistributedConfiguration(cluster),
+			naming.PatroniTrigger(cluster),
+		} {
+			endpoints := &corev1.Endpoints{ObjectMeta: meta}
+			assert.NilError(t, cc.Create(ctx, endpoints))
+			t.Cleanup(func() { assert.Check(t, client.IgnoreNotFound(cc.Delete(ctx, endpoints))) })
+		}
+
+		cleanup, err := (kubernetesEndpointsBackend{}).ClearState(ctx, cc, cluster, "some-restore")
+		assert.NilError(t, err)
+		assert.Assert(t, !cleanup.Cleared)
+		assert.Equal(t, len(cleanup.Delete), 3)
+		assert.Assert(t, cleanup.Apply == nil, "the Kubernetes backend applies nothing")
+	})
+}
+
+// TestKubernetesEndpointsPollInterval asserts the Kubernetes backend never
+// asks for a poll: Patroni writes its state into Kubernetes, and watches turn
+// those writes into reconciles.
+func TestKubernetesEndpointsPollInterval(t *testing.T) {
+	t.Parallel()
+
+	cluster := new(v1beta1.PostgresCluster)
+	cluster.Status.Patroni.SystemIdentifier = "1234567890"
+
+	assert.Equal(t, (kubernetesEndpointsBackend{}).PollInterval(cluster), time.Duration(0))
 }

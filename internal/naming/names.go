@@ -451,6 +451,17 @@ func PatroniScope(cluster *v1beta1.PostgresCluster) string {
 	return cluster.Name + "-ha"
 }
 
+// PatroniDCSCleanupJob returns the ObjectMeta for the Job that runs
+// "patronictl remove" to clear cluster's Patroni state from a DCS backend that
+// keeps it outside Kubernetes (e.g. etcd), before an in-place restore
+// re-bootstraps the cluster or the cluster is deleted.
+func PatroniDCSCleanupJob(cluster *v1beta1.PostgresCluster) metav1.ObjectMeta {
+	return metav1.ObjectMeta{
+		Namespace: cluster.GetNamespace(),
+		Name:      cluster.Name + "-patroni-dcs-cleanup",
+	}
+}
+
 // PatroniTrigger returns the ObjectMeta necessary to lookup the ConfigMap or
 // Endpoints Patroni creates for cluster to initiate a controlled change of the
 // leader. See Patroni DCS "failover_path".

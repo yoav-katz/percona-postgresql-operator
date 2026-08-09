@@ -377,9 +377,9 @@ volumes:
 			template.Spec.Containers = []corev1.Container{{Name: "database"}}
 			cluster.Labels = tt.labels
 
-			// Fixture standing in for a DCS backend's env vars (see
+			// Fixture standing in for a DCS backend's Pod additions (see
 			// internal/patroni/dcs), e.g. Kubernetes' PATRONI_KUBERNETES_*.
-			dcsEnvVars := []corev1.EnvVar{
+			dcsAdditions := PodAdditions{EnvVars: []corev1.EnvVar{
 				{
 					Name: "PATRONI_KUBERNETES_POD_IP",
 					ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
@@ -388,11 +388,11 @@ volumes:
 					}},
 				},
 				{Name: "PATRONI_KUBERNETES_PORTS", Value: "[]\n"},
-			}
+			}}
 
 			call := func() error {
 				return InstancePod(context.Background(),
-					cluster, clusterConfigMap, clusterPodService, dcsEnvVars,
+					cluster, clusterConfigMap, clusterPodService, dcsAdditions,
 					instanceSpec, instanceCertificates, instanceConfigMap, template, initImage)
 			}
 			assert.NilError(t, call())

@@ -11,14 +11,15 @@ import (
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
-	"github.com/percona/percona-postgresql-operator/v2/internal/initialize"
 	"github.com/percona/percona-postgresql-operator/v2/internal/logging"
 	"github.com/percona/percona-postgresql-operator/v2/internal/naming"
+	"github.com/percona/percona-postgresql-operator/v2/internal/patroni"
 	"github.com/percona/percona-postgresql-operator/v2/pkg/apis/upstream.pgv2.percona.com/v1beta1"
 )
 
@@ -57,9 +58,9 @@ func (kubernetesEndpointsBackend) InstanceYAML(*v1beta1.PostgresCluster) map[str
 	return nil
 }
 
-func (kubernetesEndpointsBackend) InstanceEnvVars(
+func (kubernetesEndpointsBackend) PodAdditions(
 	_ *v1beta1.PostgresCluster, leaderService *corev1.Service, podContainers []corev1.Container,
-) []corev1.EnvVar {
+) patroni.PodAdditions {
 	// "kubernetes.pod_ip" and "kubernetes.ports" cannot be known until the
 	// instance Pod is created, so they aren't set in InstanceYAML. Instead
 	// they're injected using the downward API via the
@@ -82,7 +83,7 @@ func (kubernetesEndpointsBackend) InstanceEnvVars(
 	}
 	portsYAML, _ := yaml.Marshal(ports)
 
-	return []corev1.EnvVar{
+	return patroni.PodAdditions{EnvVars: []corev1.EnvVar{
 		// Set "kubernetes.pod_ip" to the v1.Pod's primary IP address.
 		// Patroni must be restarted when changing this value.
 		{
@@ -103,7 +104,7 @@ func (kubernetesEndpointsBackend) InstanceEnvVars(
 			Name:  "PATRONI_KUBERNETES_PORTS",
 			Value: string(portsYAML),
 		},
-	}
+	}}
 }
 
 // When using Endpoints for DCS, "create", "list", "patch", and "watch" are
@@ -169,124 +170,25 @@ func (kubernetesEndpointsBackend) DistributedConfigurationService(cluster *v1bet
 	return service
 }
 
-func (kubernetesEndpointsBackend) LeaderLeaseService(
+func (kubernetesEndpointsBackend) LeaderService(
 	cluster *v1beta1.PostgresCluster, recorder record.EventRecorder,
 ) (*corev1.Service, error) {
-	service := &corev1.Service{ObjectMeta: naming.PatroniLeaderEndpoints(cluster)}
-	service.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Service"))
-
-	service.Annotations = naming.Merge(
-		cluster.Spec.Metadata.GetAnnotationsOrNil(),
-	)
-	service.Labels = naming.Merge(
-		cluster.Spec.Metadata.GetLabelsOrNil(),
-	)
-
-	if spec := cluster.Spec.Service; spec != nil {
-		service.Annotations = naming.Merge(service.Annotations,
-			spec.Metadata.GetAnnotationsOrNil())
-		service.Labels = naming.Merge(service.Labels,
-			spec.Metadata.GetLabelsOrNil())
-	}
-
-	// add our labels last so they aren't overwritten
-	service.Labels = naming.Merge(service.Labels,
-		naming.WithPerconaLabels(map[string]string{ // K8SPG-430
-			naming.LabelCluster: cluster.Name,
-			naming.LabelPatroni: naming.PatroniScope(cluster),
-		}, cluster.Name, "", cluster.Labels[naming.LabelVersion]))
-
-	// Allocate an IP address and/or node port and let Patroni manage the Endpoints.
-	// Patroni will ensure that they always route to the elected leader.
+	// Allocate an IP address and/or node port and let Patroni manage the
+	// Endpoints. Patroni will ensure that they always route to the elected
+	// leader, so this Service needs no selector of its own.
 	// - https://docs.k8s.io/concepts/services-networking/service/#services-without-selectors
-	service.Spec.Selector = nil
-
-	// The TargetPort must be the name (not the number) of the PostgreSQL
-	// ContainerPort. This name allows the port number to differ between
-	// instances, which can happen during a rolling update.
-	servicePort := corev1.ServicePort{
-		Name:       naming.PortPostgreSQL,
-		Port:       *cluster.Spec.Port,
-		Protocol:   corev1.ProtocolTCP,
-		TargetPort: intstr.FromString(naming.PortPostgreSQL),
-	}
-
-	if spec := cluster.Spec.Service; spec == nil {
-		service.Spec.Type = corev1.ServiceTypeClusterIP
-	} else {
-		service.Spec.Type = corev1.ServiceType(spec.Type)
-		// K8SPG-389
-		service.Spec.LoadBalancerSourceRanges = spec.LoadBalancerSourceRanges
-
-		if spec.NodePort != nil {
-			if service.Spec.Type == corev1.ServiceTypeClusterIP {
-				// The NodePort can only be set when the Service type is NodePort or
-				// LoadBalancer. However, due to a known issue prior to Kubernetes
-				// 1.20, we clear these errors during our apply. To preserve the
-				// appropriate behavior, we log an Event and return an error.
-				// TODO(tjmoore4): Once Validation Rules are available, this check
-				// and event could potentially be removed in favor of that validation
-				recorder.Eventf(cluster, corev1.EventTypeWarning, "MisconfiguredClusterIP",
-					"NodePort cannot be set with type ClusterIP on Service %q", service.Name)
-				return nil, errors.Errorf("NodePort cannot be set with type ClusterIP on Service %q", service.Name)
-			}
-			servicePort.NodePort = *spec.NodePort
-		}
-		service.Spec.ExternalTrafficPolicy = initialize.FromPointer(spec.ExternalTrafficPolicy)
-		service.Spec.InternalTrafficPolicy = spec.InternalTrafficPolicy
-	}
-	service.Spec.Ports = []corev1.ServicePort{servicePort}
-
-	return service, nil
+	return leaderService(cluster, recorder, nil)
 }
 
 func (kubernetesEndpointsBackend) PrimaryService(
 	cluster *v1beta1.PostgresCluster, leader *corev1.Service,
 ) (corev1.ServiceSpec, *corev1.EndpointSubset, error) {
-	// We want to name and label our primary Service consistently. When Patroni is
-	// using Endpoints for its DCS, however, they and any Service that uses them
-	// must use the same name as the Patroni "scope" which has its own constraints.
-	//
-	// To stay free from those constraints, our primary Service resolves to the
-	// ClusterIP of the Service created in Reconciler.reconcilePatroniLeaderLease
-	// when Patroni is using Endpoints.
-	if leader == nil {
-		return corev1.ServiceSpec{}, nil, errors.New("Patroni leader Service is not available yet")
-	}
-
-	// Allocate no IP address (headless) and manage the Endpoints ourselves.
-	// - https://docs.k8s.io/concepts/services-networking/service/#headless-services
-	// - https://docs.k8s.io/concepts/services-networking/service/#services-without-selectors
-	spec := corev1.ServiceSpec{
-		ClusterIP: corev1.ClusterIPNone,
-		Selector:  nil,
-		Ports: []corev1.ServicePort{{
-			Name:       naming.PortPostgreSQL,
-			Port:       *cluster.Spec.Port,
-			Protocol:   corev1.ProtocolTCP,
-			TargetPort: intstr.FromString(naming.PortPostgreSQL),
-		}},
-	}
-
-	// Resolve to the ClusterIP for which Patroni has configured the Endpoints.
-	subset := &corev1.EndpointSubset{
-		Addresses: []corev1.EndpointAddress{{IP: leader.Spec.ClusterIP}},
-	}
-
-	// Copy the EndpointPorts from the ServicePorts.
-	for _, sp := range spec.Ports {
-		subset.Ports = append(subset.Ports, corev1.EndpointPort{
-			Name:     sp.Name,
-			Port:     sp.Port,
-			Protocol: sp.Protocol,
-		})
-	}
-
-	return spec, subset, nil
+	return primaryServiceViaLeader(cluster, leader)
 }
 
 func (kubernetesEndpointsBackend) Observe(
-	ctx context.Context, cli client.Client, cluster *v1beta1.PostgresCluster, readyInstance bool,
+	ctx context.Context, cli client.Client, cluster *v1beta1.PostgresCluster,
+	readyInstance bool, _ *corev1.Pod, _ patroni.Executor,
 ) (Observation, error) {
 	var observation Observation
 
@@ -308,14 +210,58 @@ func (kubernetesEndpointsBackend) Observe(
 			// is detected in the cluster we assume this is the case, and simply log a message and
 			// requeue in order to try again until the expected value is found.
 			logging.FromContext(ctx).Info("detected ready instance but no initialize value")
-			observation.RequeueAfter = time.Second
+			observation.RetryAfter = time.Second
 		}
 	}
 
 	return observation, err
 }
 
-func (kubernetesEndpointsBackend) Delete(ctx context.Context, cli client.Client, cluster *v1beta1.PostgresCluster) error {
+// PollInterval is zero: Patroni writes its state into Kubernetes objects, and
+// the operator's watches turn those writes into reconciles.
+func (kubernetesEndpointsBackend) PollInterval(*v1beta1.PostgresCluster) time.Duration {
+	return 0
+}
+
+// PodRequiresRestart reads the "status" annotation Patroni writes on its own
+// Pod when using Kubernetes for DCS.
+func (kubernetesEndpointsBackend) PodRequiresRestart(
+	_ context.Context, _ *v1beta1.PostgresCluster, pod *corev1.Pod, _ patroni.Executor,
+) (bool, error) {
+	return patroni.PodRequiresRestart(pod), nil
+}
+
+// ClearState reports on the Endpoints objects Patroni uses to hold the leader
+// lock, the distributed configuration, and any pending failover. Deleting them
+// makes the cluster forget it was ever initialized.
+func (kubernetesEndpointsBackend) ClearState(
+	ctx context.Context, cli client.Client, cluster *v1beta1.PostgresCluster, _ string,
+) (StateCleanup, error) {
+	var cleanup StateCleanup
+
+	for _, meta := range []metav1.ObjectMeta{
+		naming.PatroniLeaderEndpoints(cluster),
+		naming.PatroniDistributedConfiguration(cluster),
+		naming.PatroniTrigger(cluster),
+	} {
+		endpoints := &corev1.Endpoints{ObjectMeta: meta}
+		err := cli.Get(ctx, client.ObjectKeyFromObject(endpoints), endpoints)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return cleanup, errors.WithStack(err)
+		}
+		cleanup.Delete = append(cleanup.Delete, endpoints)
+	}
+
+	cleanup.Cleared = len(cleanup.Delete) == 0
+	return cleanup, nil
+}
+
+func (kubernetesEndpointsBackend) Delete(
+	ctx context.Context, cli client.Client, cluster *v1beta1.PostgresCluster,
+) (StateCleanup, error) {
 	// TODO(cbandy): This could also be accomplished by adopting the Endpoints
 	// as Patroni creates them. Would their events cause too many reconciles?
 	// Foreground deletion may force us to adopt and set finalizers anyway.
@@ -330,5 +276,6 @@ func (kubernetesEndpointsBackend) Delete(ctx context.Context, cli client.Client,
 		)
 	}
 
-	return err
+	// DeleteAllOf is synchronous, so there is nothing to wait for.
+	return StateCleanup{Cleared: true}, err
 }

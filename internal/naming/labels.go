@@ -85,6 +85,11 @@ const (
 	// resource (e.g. a ConfigMap or Secret) is for a pgBackRest restore
 	LabelPGBackRestRestoreConfig = labelPrefix + "pgbackrest-restore-config"
 
+	// LabelPatroniDCSCleanup is used to indicate that a Job removes cluster's
+	// Patroni state from a DCS backend that keeps it outside Kubernetes (e.g.
+	// etcd), before an in-place restore or during teardown.
+	LabelPatroniDCSCleanup = labelPrefix + "patroni-dcs-cleanup"
+
 	// LabelPGMonitorDiscovery is the label added to Pods running the "exporter" container to
 	// support discovery by Prometheus according to pgMonitor configuration
 	LabelPGMonitorDiscovery = labelPrefix + "crunchy-postgres-exporter"
@@ -250,6 +255,23 @@ func PGBackRestRestoreJobLabels(clusterName string) labels.Set {
 // PGBackRestRestoreJobSelector provides selector for querying pgBackRest restore Jobs.
 func PGBackRestRestoreJobSelector(clusterName string) labels.Selector {
 	return PGBackRestRestoreJobLabels(clusterName).AsSelector()
+}
+
+// PatroniDCSCleanupJobLabels provides labels for the Job that runs
+// "patronictl remove" to clear cluster's Patroni state from a DCS backend that
+// keeps it outside Kubernetes (e.g. etcd).
+func PatroniDCSCleanupJobLabels(clusterName string) labels.Set {
+	commonLabels := map[string]string{LabelCluster: clusterName}
+	jobLabels := map[string]string{
+		LabelPatroniDCSCleanup: "",
+	}
+	return labels.Merge(jobLabels, commonLabels)
+}
+
+// PatroniDCSCleanupJobSelector provides a selector for querying the Patroni
+// DCS cleanup Job.
+func PatroniDCSCleanupJobSelector(clusterName string) labels.Selector {
+	return PatroniDCSCleanupJobLabels(clusterName).AsSelector()
 }
 
 // PGBackRestRepoLabels provides common labels for pgBackRest repository

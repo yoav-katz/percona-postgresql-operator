@@ -6,6 +6,8 @@ package patroni
 
 import (
 	"context"
+	"fmt"
+	"path"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -86,14 +88,24 @@ func InstanceCertificates(ctx context.Context,
 	return err
 }
 
+// PodAdditions are the Volumes, VolumeMounts, and environment variables a DCS
+// backend needs in any Pod that runs Patroni or patronictl. The type lives
+// here rather than in internal/patroni/dcs because this package must not
+// import that one; the backends fill it in.
+type PodAdditions struct {
+	Volumes      []corev1.Volume
+	VolumeMounts []corev1.VolumeMount
+	EnvVars      []corev1.EnvVar
+}
+
 // InstancePod populates a PodTemplateSpec with the fields needed to run Patroni.
-// The database container must already be in the template. dcsEnvVars are the
+// The database container must already be in the template. dcsAdditions are the
 // DCS backend's additions (see internal/patroni/dcs).
 func InstancePod(ctx context.Context,
 	inCluster *v1beta1.PostgresCluster,
 	inClusterConfigMap *corev1.ConfigMap,
 	inClusterPodService *corev1.Service,
-	dcsEnvVars []corev1.EnvVar,
+	dcsAdditions PodAdditions,
 	inInstanceSpec *v1beta1.PostgresInstanceSetSpec,
 	inInstanceCertificates *corev1.Secret,
 	inInstanceConfigMap *corev1.ConfigMap,
@@ -121,7 +133,7 @@ func InstancePod(ctx context.Context,
 	}
 
 	container.Env = append(container.Env,
-		instanceEnvironment(inCluster, inClusterPodService, dcsEnvVars)...)
+		instanceEnvironment(inCluster, inClusterPodService, dcsAdditions.EnvVars)...)
 
 	volume := corev1.Volume{Name: "patroni-config"}
 	volume.Projected = new(corev1.ProjectedVolumeSource)
@@ -141,6 +153,9 @@ func InstancePod(ctx context.Context,
 		ReadOnly:  true,
 	})
 
+	outInstancePod.Spec.Volumes = append(outInstancePod.Spec.Volumes, dcsAdditions.Volumes...)
+	container.VolumeMounts = append(container.VolumeMounts, dcsAdditions.VolumeMounts...)
+
 	instanceProbes(inCluster, container)
 
 	// K8SPG-708
@@ -149,6 +164,58 @@ func InstancePod(ctx context.Context,
 	}
 
 	return nil
+}
+
+// RemoveClusterPod populates a PodTemplateSpec's existing "database"-named
+// container to run "patronictl remove", which clears Patroni's state for
+// cluster from whichever DCS it is configured to use: the leader lock, the
+// member keys, and the "initialize" key. DCS backends that keep state outside
+// Kubernetes use this to make a cluster forget itself before an in-place
+// restore re-bootstraps it, and on teardown.
+//
+// This must only run once Patroni is stopped everywhere, or a live instance
+// will simply re-register itself. dcsAdditions are the backend's own Pod
+// additions, needed here for the same reason InstancePod needs them.
+func RemoveClusterPod(
+	cluster *v1beta1.PostgresCluster,
+	clusterConfigMap, instanceConfigMap *corev1.ConfigMap,
+	inInstanceCertificates *corev1.Secret,
+	dcsAdditions PodAdditions,
+	outPod *corev1.PodTemplateSpec,
+) {
+	var container *corev1.Container
+	for i := range outPod.Spec.Containers {
+		if outPod.Spec.Containers[i].Name == naming.ContainerDatabase {
+			container = &outPod.Spec.Containers[i]
+		}
+	}
+
+	// "patronictl remove" is interactive: it prompts for the cluster name, then
+	// for a confirmation phrase. Feed it both on stdin.
+	scope := naming.PatroniScope(cluster)
+	configFile := path.Join(configDirectory, "~postgres-operator_cluster.yaml")
+	container.Command = []string{"sh", "-c",
+		fmt.Sprintf("printf '%s\\nYes I am aware\\n' %s | exec patronictl -c %s remove %s",
+			quoteShellWord(scope), quoteShellWord(scope),
+			quoteShellWord(configFile), quoteShellWord(scope)),
+	}
+
+	volume := corev1.Volume{Name: "patroni-config"}
+	volume.Projected = new(corev1.ProjectedVolumeSource)
+	volume.Projected.Sources = append(append(volume.Projected.Sources,
+		instanceConfigFiles(clusterConfigMap, instanceConfigMap)...),
+		instanceCertificates(inInstanceCertificates)...)
+
+	outPod.Spec.Volumes = append(outPod.Spec.Volumes, volume)
+	container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+		Name:      volume.Name,
+		MountPath: configDirectory,
+		ReadOnly:  true,
+	})
+
+	outPod.Spec.Volumes = append(outPod.Spec.Volumes, dcsAdditions.Volumes...)
+	container.VolumeMounts = append(container.VolumeMounts, dcsAdditions.VolumeMounts...)
+	container.Env = append(container.Env, dcsAdditions.EnvVars...)
 }
 
 // K8SPG-708 instanceInitContainer adds the instance init container

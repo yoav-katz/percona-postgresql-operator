@@ -47,13 +47,100 @@ type PatroniSpec struct {
 	CreateReplicaMethods []CreateReplicaMethod `json:"createReplicaMethods,omitempty"`
 
 	// TODO(cbandy): Add UseConfigMaps bool, default false.
-	// TODO(cbandy): Allow other DCS: etcd, raft, etc?
-	// N.B. changing this will cause downtime.
 	// - https://patroni.readthedocs.io/en/latest/kubernetes.html
+
+	// DCS configures the distributed configuration store backend.
+	// Defaults to the Kubernetes-native backend (Endpoints).
+	// N.B. Changing the DCS type causes downtime; all instances must restart
+	// simultaneously. It is rejected by a validation rule on the cluster spec.
+	// +optional
+	DCS *PatroniDCS `json:"dcs,omitempty"`
 
 	// RemoveDataDirectoryOnDivergedTimelines allows controlling remove_data_directory_on_diverged_timelines in Patroni cluster config.
 	// +optional
 	RemoveDataDirectoryOnDivergedTimelines bool `json:"removeDataDirectoryOnDivergedTimelines,omitempty"`
+}
+
+// PatroniDCSType identifies which DCS backend Patroni should use.
+// +kubebuilder:validation:Enum={kubernetes,etcd}
+type PatroniDCSType string
+
+const (
+	PatroniDCSTypeKubernetes PatroniDCSType = "kubernetes"
+	PatroniDCSTypeEtcd       PatroniDCSType = "etcd"
+)
+
+// PatroniDCS configures the Patroni distributed configuration store (DCS).
+//
+// NOTE: The immutability of "type" is enforced on the cluster spec rather than
+// here. A transition rule on this struct only runs when "dcs" exists in both
+// the old and new object, so a cluster created without a "dcs" section could
+// otherwise be switched to etcd by adding one.
+// +kubebuilder:validation:XValidation:rule="self.type != 'etcd' || (has(self.etcd) && size(self.etcd.endpoints) > 0)",message="etcd.endpoints must be non-empty when type is etcd"
+type PatroniDCS struct {
+	// Type of DCS backend. Defaults to "kubernetes".
+	// This field is immutable after cluster creation because changing it
+	// requires every instance to restart at once.
+	// +optional
+	// +kubebuilder:default=kubernetes
+	// +kubebuilder:validation:Enum={kubernetes,etcd}
+	Type PatroniDCSType `json:"type,omitempty"`
+
+	// Etcd holds settings for the external etcd DCS backend.
+	// Required when type is "etcd".
+	// +optional
+	Etcd *PatroniEtcdSpec `json:"etcd,omitempty"`
+}
+
+// PatroniEtcdSpec defines connectivity to an external etcd cluster used as DCS.
+type PatroniEtcdSpec struct {
+	// Endpoints is the list of etcd endpoints including scheme and port.
+	// Example: ["https://etcd.etcd-cluster.svc:2379"]
+	// The scheme of the first endpoint determines the protocol used.
+	// All endpoints must use the same scheme.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=7
+	// +kubebuilder:validation:items:Pattern=`^https?://[^/]`
+	// +kubebuilder:validation:XValidation:rule="self.all(e, url(e).getScheme() == 'http') || self.all(e, url(e).getScheme() == 'https')",message="all endpoints must use the same scheme (http or https)"
+	Endpoints []string `json:"endpoints"`
+
+	// TLSSecret is the name of a Secret in the same namespace with keys
+	// ca.crt, tls.crt, and tls.key for mutual TLS with etcd.
+	// +optional
+	TLSSecret string `json:"tlsSecret,omitempty"`
+
+	// AuthSecret is the name of a Secret in the same namespace with keys
+	// username and password for etcd authentication.
+	// +optional
+	AuthSecret string `json:"authSecret,omitempty"`
+}
+
+// GetDCS returns the DCS configuration, or nil if unset.
+func (s *PatroniSpec) GetDCS() *PatroniDCS {
+	if s == nil {
+		return nil
+	}
+	return s.DCS
+}
+
+// GetDCS returns the DCS configuration for the cluster, or nil if unset.
+func (c *PostgresCluster) GetDCS() *PatroniDCS {
+	return c.Spec.Patroni.GetDCS()
+}
+
+// DCSType returns the effective DCS type, defaulting to Kubernetes when unset.
+// Only DCS backend selection (internal/patroni/dcs) and validation should need
+// this; everything else asks the backend for the behavior it wants.
+func (s *PatroniSpec) DCSType() PatroniDCSType {
+	if dcs := s.GetDCS(); dcs != nil && dcs.Type != "" {
+		return dcs.Type
+	}
+	return PatroniDCSTypeKubernetes
+}
+
+// DCSType returns the effective DCS type, defaulting to Kubernetes when unset.
+func (c *PostgresCluster) DCSType() PatroniDCSType {
+	return c.Spec.Patroni.DCSType()
 }
 
 // +kubebuilder:validation:Enum={basebackup,pgbackrest}

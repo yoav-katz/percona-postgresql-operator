@@ -415,7 +415,22 @@ func (r *snapshotRestorer) pvcSpecFromDataSource(
 	return dataVolSpec, nil
 }
 
+// reconcileLeaderEndpoints clears the stale Patroni leader lock so the cluster
+// can elect a new leader against the restored data.
+//
+// This only knows how to clear the lock when Patroni keeps it in a Kubernetes
+// Endpoints object. Under a DCS backend that keeps state elsewhere (e.g. etcd)
+// the lock would survive the restore, so refuse rather than restore onto state
+// that is about to contradict the data.
+// TODO(K8SPG-1057): clear it through dcs.Backend.ClearState, which already
+// knows how for every backend, and drop this restriction.
 func (r *snapshotRestorer) reconcileLeaderEndpoints(ctx context.Context) error {
+	if r.cluster.Spec.Patroni.DCSType() != crunchyv1beta1.PatroniDCSTypeKubernetes {
+		return errors.Errorf(
+			"snapshot restore is not supported with spec.patroni.dcs.type %q",
+			r.cluster.Spec.Patroni.DCSType())
+	}
+
 	postgresCluster := &crunchyv1beta1.PostgresCluster{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      r.cluster.Name,

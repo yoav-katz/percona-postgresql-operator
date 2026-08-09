@@ -277,7 +277,7 @@ func (r *Reconciler) reconcileDataSource(ctx context.Context,
 
 	// observe all resources currently relevant to reconciling data sources, and update status
 	// accordingly
-	endpoints, restoreJob, err := r.observeRestoreEnv(ctx, cluster)
+	restoreJob, err := r.observeRestoreEnv(ctx, cluster)
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
@@ -367,7 +367,7 @@ func (r *Reconciler) reconcileDataSource(ctx context.Context,
 	// - The restore ID has changed (i.e. the user provide a new value for the restore
 	//   annotation, indicating they want a new in-place restore)
 	if (restoringInPlace && (!readyForRestore || configChanged)) || restoreIDChanged {
-		if err := r.prepareForRestore(ctx, cluster, observed, endpoints,
+		if err := r.prepareForRestore(ctx, cluster, observed,
 			restoreJob, restoreID); err != nil {
 			return true, err
 		}

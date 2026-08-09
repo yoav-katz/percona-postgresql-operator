@@ -26,10 +26,74 @@ import (
 
 // +kubebuilder:rbac:groups="",resources="endpoints",verbs={deletecollection}
 
+// deletePatroniArtifacts removes the state the DCS backend keeps for cluster.
+// It returns false when the backend needs another reconcile to finish, in
+// which case the caller must not release the finalizer yet.
 func (r *Reconciler) deletePatroniArtifacts(
 	ctx context.Context, cluster *v1beta1.PostgresCluster,
-) error {
-	return dcs.For(cluster).Delete(ctx, r.Client, cluster)
+) (bool, error) {
+	cleanup, err := dcs.For(cluster).Delete(ctx, r.Client, cluster)
+	if err != nil {
+		return false, err
+	}
+	return r.applyStateCleanup(ctx, cluster, cleanup)
+}
+
+// applyStateCleanup carries out the work a DCS backend asked for and reports
+// whether the backend considers its state cleared. Backends only read; every
+// write they want goes through here so ownership, apply, and event recording
+// stay in one place.
+func (r *Reconciler) applyStateCleanup(
+	ctx context.Context, cluster *v1beta1.PostgresCluster, cleanup dcs.StateCleanup,
+) (bool, error) {
+	if warning := cleanup.Warning; warning != nil {
+		r.Recorder.Eventf(cluster, corev1.EventTypeWarning, warning.Reason, "%s", warning.Message)
+	}
+
+	for _, object := range cleanup.Delete {
+		if err := r.Client.Delete(ctx, object,
+			client.PropagationPolicy(metav1.DeletePropagationBackground),
+		); client.IgnoreNotFound(err) != nil {
+			return false, errors.WithStack(err)
+		}
+	}
+
+	if cleanup.Apply != nil {
+		if err := r.setControllerReference(cluster, cleanup.Apply); err != nil {
+			return false, errors.WithStack(err)
+		}
+		if err := r.apply(ctx, cleanup.Apply); err != nil {
+			return false, errors.WithStack(err)
+		}
+	}
+
+	return cleanup.Cleared, nil
+}
+
+// podExecutor returns a patroni.Executor that runs commands in pod's database
+// container.
+func (r *Reconciler) podExecutor(pod *corev1.Pod) patroni.Executor {
+	return patroni.Executor(func(
+		ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, command ...string,
+	) error {
+		return r.PodExec(ctx, pod.Namespace, pod.Name, naming.ContainerDatabase,
+			stdin, stdout, stderr, command...)
+	})
+}
+
+// runningInstancePod returns a Pod whose database container is running, or nil
+// when there is none.
+func runningInstancePod(instances *observedInstances) *corev1.Pod {
+	for _, instance := range instances.forCluster {
+		if terminating, known := instance.IsTerminating(); !terminating && known {
+			running, known := instance.IsRunning(naming.ContainerDatabase)
+
+			if running && known && len(instance.Pods) > 0 {
+				return instance.Pods[0]
+			}
+		}
+	}
+	return nil
 }
 
 func (r *Reconciler) handlePatroniRestarts(
@@ -38,26 +102,41 @@ func (r *Reconciler) handlePatroniRestarts(
 	const container = naming.ContainerDatabase
 	var primaryNeedsRestart, replicaNeedsRestart *Instance
 
+	backend := dcs.For(cluster)
+
 	// Look for one primary and one replica that need to restart. Ignore
 	// containers that are terminating or not running; Kubernetes will start
 	// them again, and calls to their Patroni API will likely be interrupted anyway.
+	//
+	// The liveness guards run before asking the backend, since a backend may
+	// answer by calling into the Pod.
 	for _, instance := range instances.forCluster {
-		if len(instance.Pods) > 0 && patroni.PodRequiresRestart(instance.Pods[0]) {
-			if terminating, known := instance.IsTerminating(); terminating || !known {
-				continue
-			}
-			if running, known := instance.IsRunning(container); !running || !known {
-				continue
-			}
+		if len(instance.Pods) == 0 {
+			continue
+		}
+		if terminating, known := instance.IsTerminating(); terminating || !known {
+			continue
+		}
+		if running, known := instance.IsRunning(container); !running || !known {
+			continue
+		}
 
-			if primary, _ := instance.IsPrimary(); primary {
-				primaryNeedsRestart = instance
-			} else {
-				replicaNeedsRestart = instance
-			}
-			if primaryNeedsRestart != nil && replicaNeedsRestart != nil {
-				break
-			}
+		pod := instance.Pods[0]
+		restart, err := backend.PodRequiresRestart(ctx, cluster, pod, r.podExecutor(pod))
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if !restart {
+			continue
+		}
+
+		if primary, _ := instance.IsPrimary(); primary {
+			primaryNeedsRestart = instance
+		} else {
+			replicaNeedsRestart = instance
+		}
+		if primaryNeedsRestart != nil && replicaNeedsRestart != nil {
+			break
 		}
 	}
 
@@ -173,17 +252,7 @@ func (r *Reconciler) reconcilePatroniDynamicConfiguration(
 		return nil
 	}
 
-	var pod *corev1.Pod
-	for _, instance := range instances.forCluster {
-		if terminating, known := instance.IsTerminating(); !terminating && known {
-			running, known := instance.IsRunning(naming.ContainerDatabase)
-
-			if running && known && len(instance.Pods) > 0 {
-				pod = instance.Pods[0]
-				break
-			}
-		}
-	}
+	pod := runningInstancePod(instances)
 	if pod == nil {
 		// There are no running Patroni containers; nothing to do.
 		return nil
@@ -192,9 +261,7 @@ func (r *Reconciler) reconcilePatroniDynamicConfiguration(
 	// NOTE(cbandy): Despite the guards above, calling PodExec may still fail
 	// due to a missing or stopped container.
 
-	exec := func(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, command ...string) error {
-		return r.PodExec(ctx, pod.Namespace, pod.Name, naming.ContainerDatabase, stdin, stdout, stderr, command...)
-	}
+	exec := r.podExecutor(pod)
 
 	var configuration map[string]any
 	if cluster.Spec.Patroni != nil {
@@ -205,7 +272,7 @@ func (r *Reconciler) reconcilePatroniDynamicConfiguration(
 	logging.FromContext(ctx).V(1).Info("Replacing patroni dynamic configuration")
 
 	return errors.WithStack(
-		patroni.Executor(exec).ReplaceConfiguration(ctx, configuration),
+		exec.ReplaceConfiguration(ctx, configuration),
 	)
 }
 
@@ -217,7 +284,7 @@ func (r *Reconciler) reconcilePatroniDynamicConfiguration(
 func (r *Reconciler) reconcilePatroniLeaderLease(
 	ctx context.Context, cluster *v1beta1.PostgresCluster,
 ) (*corev1.Service, error) {
-	service, err := dcs.For(cluster).LeaderLeaseService(cluster, r.Recorder)
+	service, err := dcs.For(cluster).LeaderService(cluster, r.Recorder)
 	if err == nil && service != nil {
 		err = errors.WithStack(r.setControllerReference(cluster, service))
 	}
@@ -241,13 +308,31 @@ func (r *Reconciler) reconcilePatroniStatus(
 		}
 	}
 
-	observation, err := dcs.For(cluster).Observe(ctx, r.Client, cluster, readyInstance)
+	backend := dcs.For(cluster)
+
+	// A backend may need to ask a running instance directly, rather than read
+	// something Patroni wrote to Kubernetes.
+	var exec patroni.Executor
+	pod := runningInstancePod(observedInstances)
+	if pod != nil {
+		exec = r.podExecutor(pod)
+	}
+
+	observation, err := backend.Observe(ctx, r.Client, cluster, readyInstance, pod, exec)
 	if err == nil && observation.SystemIdentifier != "" {
 		// After bootstrap, the DCS backend reports the cluster system identifier.
 		cluster.Status.Patroni.SystemIdentifier = observation.SystemIdentifier
 	}
 
-	return observation.RequeueAfter, err
+	// Requeue on whichever the backend wants sooner: another attempt at an
+	// observation it could not make, or its standing poll for state it cannot
+	// deliver as a watch event.
+	requeue := observation.RetryAfter
+	if poll := backend.PollInterval(cluster); poll > 0 && (requeue == 0 || poll < requeue) {
+		requeue = poll
+	}
+
+	return requeue, err
 }
 
 // reconcileReplicationSecret creates a secret containing the TLS

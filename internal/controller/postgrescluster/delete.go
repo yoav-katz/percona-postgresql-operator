@@ -6,6 +6,7 @@ package postgrescluster
 
 import (
 	"context"
+	"time"
 
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -80,9 +81,13 @@ func (r *Reconciler) handleDelete(
 		return result, nil
 	}
 
-	// Instances are stopped, now cleanup some Patroni stuff.
-	if err := r.deletePatroniArtifacts(ctx, cluster); err != nil {
+	// Instances are stopped, now cleanup some Patroni stuff. A DCS backend
+	// that keeps its state outside Kubernetes may need a Job to clear it, so
+	// hold the finalizer until it reports it is done.
+	if done, err := r.deletePatroniArtifacts(ctx, cluster); err != nil {
 		return nil, err
+	} else if !done {
+		return &reconcile.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	// Our finalizer logic is finished; remove our finalizer.

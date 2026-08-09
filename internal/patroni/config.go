@@ -25,6 +25,11 @@ const (
 	configMapFileKey = "patroni.yaml"
 )
 
+// ConfigDirectory is where Patroni's configuration files are mounted. It is
+// exported for DCS backends (internal/patroni/dcs), which mount their own
+// files alongside them.
+const ConfigDirectory = configDirectory
+
 const (
 	basebackupCreateReplicaMethod = "basebackup"
 	pgBackRestCreateReplicaMethod = "pgbackrest"

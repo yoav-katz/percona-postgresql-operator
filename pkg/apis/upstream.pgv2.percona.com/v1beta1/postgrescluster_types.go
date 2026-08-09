@@ -22,6 +22,10 @@ import (
 )
 
 // PostgresClusterSpec defines the desired state of PostgresCluster
+// The DCS rule is written against the whole spec, not against
+// spec.patroni.dcs, so that it still runs when either object omits the
+// optional "patroni" or "dcs" sections.
+// +kubebuilder:validation:XValidation:rule="(has(oldSelf.patroni) && has(oldSelf.patroni.dcs) ? oldSelf.patroni.dcs.type : 'kubernetes') == (has(self.patroni) && has(self.patroni.dcs) ? self.patroni.dcs.type : 'kubernetes')",message="spec.patroni.dcs.type is immutable after cluster creation"
 type PostgresClusterSpec struct {
 	// +optional
 	Metadata *Metadata `json:"metadata,omitempty"`

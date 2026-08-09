@@ -1279,9 +1279,9 @@ func (r *Reconciler) reconcileInstance(
 			return errors.Wrap(err, "failed to determine initial init image")
 		}
 
-		dcsEnvVars := dcs.For(cluster).InstanceEnvVars(cluster, patroniLeaderService, instance.Spec.Template.Spec.Containers)
+		dcsAdditions := dcs.For(cluster).PodAdditions(cluster, patroniLeaderService, instance.Spec.Template.Spec.Containers)
 		err = patroni.InstancePod(
-			ctx, cluster, clusterConfigMap, clusterPodService, dcsEnvVars,
+			ctx, cluster, clusterConfigMap, clusterPodService, dcsAdditions,
 			spec, instanceCertificates, instanceConfigMap, &instance.Spec.Template, initImage) // K8SPG-708
 	}
 

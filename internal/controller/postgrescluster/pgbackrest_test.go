@@ -3859,7 +3859,6 @@ func TestObserveRestoreEnv(t *testing.T) {
 
 	type testResult struct {
 		foundRestoreJob          bool
-		endpointCount            int
 		expectedClusterCondition *metav1.Condition
 	}
 
@@ -3889,7 +3888,6 @@ func TestObserveRestoreEnv(t *testing.T) {
 			},
 			result: testResult{
 				foundRestoreJob:          true,
-				endpointCount:            3,
 				expectedClusterCondition: nil,
 			},
 		}, {
@@ -3910,7 +3908,6 @@ func TestObserveRestoreEnv(t *testing.T) {
 			},
 			result: testResult{
 				foundRestoreJob:          false,
-				endpointCount:            3,
 				expectedClusterCondition: nil,
 			},
 		}, {
@@ -3921,7 +3918,6 @@ func TestObserveRestoreEnv(t *testing.T) {
 			},
 			result: testResult{
 				foundRestoreJob:          true,
-				endpointCount:            0,
 				expectedClusterCondition: nil,
 			},
 		}, {
@@ -3936,7 +3932,6 @@ func TestObserveRestoreEnv(t *testing.T) {
 			},
 			result: testResult{
 				foundRestoreJob: true,
-				endpointCount:   0,
 				expectedClusterCondition: &metav1.Condition{
 					Type:    ConditionPostgresDataInitialized,
 					Status:  metav1.ConditionTrue,
@@ -3956,7 +3951,6 @@ func TestObserveRestoreEnv(t *testing.T) {
 			},
 			result: testResult{
 				foundRestoreJob: true,
-				endpointCount:   0,
 				expectedClusterCondition: &metav1.Condition{
 					Type:    ConditionPostgresDataInitialized,
 					Status:  metav1.ConditionFalse,
@@ -3976,11 +3970,10 @@ func TestObserveRestoreEnv(t *testing.T) {
 				cluster := fakePostgresCluster(clusterName, namespace, clusterUID, dedicated)
 				tc.createResources(t, cluster)
 
-				endpoints, job, err := r.observeRestoreEnv(ctx, cluster)
+				job, err := r.observeRestoreEnv(ctx, cluster)
 				assert.NilError(t, err)
 
 				assert.Assert(t, tc.result.foundRestoreJob == (job != nil))
-				assert.Assert(t, tc.result.endpointCount == len(endpoints))
 
 				if tc.result.expectedClusterCondition != nil {
 					condition := meta.FindStatusCondition(cluster.Status.Conditions,
@@ -4170,14 +4163,14 @@ func TestPrepareForRestore(t *testing.T) {
 					Message:            "pgBackRest restore completed successfully",
 				})
 
-				job, endpoints := tc.createResources(t, cluster)
+				job, _ := tc.createResources(t, cluster)
 				restoreID := "test-restore-id"
 
 				fakeObserved := &observedInstances{forCluster: []*Instance{}}
 				if tc.fakeObserved != nil {
 					fakeObserved = tc.fakeObserved
 				}
-				assert.NilError(t, r.prepareForRestore(ctx, cluster, fakeObserved, endpoints,
+				assert.NilError(t, r.prepareForRestore(ctx, cluster, fakeObserved,
 					job, restoreID))
 
 				var primaryInstance *Instance

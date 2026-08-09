@@ -108,7 +108,10 @@ func (r *PGClusterReconciler) SetupWithManager(ctx context.Context, mgr manager.
 		For(&v2.PerconaPGCluster{}).
 		Owns(&v1beta1.PostgresCluster{}).
 		WatchesRawSource(source.Kind(mgr.GetCache(), &corev1.Service{}, r.watchServices())).
-		Watches(&corev1.Secret{}, r.watchEnvFromSecrets()).
+		Watches(&corev1.Secret{}, r.watchSecretsByIndex(
+			v2.IndexFieldEnvFromSecrets, "watchEnvFromSecrets")).
+		Watches(&corev1.Secret{}, r.watchSecretsByIndex(
+			v2.IndexFieldPatroniEtcdSecrets, "watchPatroniEtcdSecrets")).
 		Watches(&corev1.Secret{}, r.watchPGBouncerUserSecrets()).
 		Watches(&corev1.ConfigMap{}, r.watchLogRotateExtraConfig()).
 		WatchesRawSource(source.Kind(mgr.GetCache(), &corev1.Secret{}, r.watchSecrets())).
@@ -171,9 +174,11 @@ func (r *PGClusterReconciler) watchPGBackups() handler.TypedFuncs[*v2.PerconaPGB
 	}
 }
 
-func (r *PGClusterReconciler) watchEnvFromSecrets() handler.TypedEventHandler[client.Object, reconcile.Request] {
+// watchSecretsByIndex enqueues the clusters that reference a changed Secret
+// through the named field index. name only labels the log.
+func (r *PGClusterReconciler) watchSecretsByIndex(index, name string) handler.TypedEventHandler[client.Object, reconcile.Request] {
 	return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-		log := logf.FromContext(ctx).WithName("watchEnvFromSecrets")
+		log := logf.FromContext(ctx).WithName(name)
 
 		secret, ok := obj.(*corev1.Secret)
 		if !ok {
@@ -182,9 +187,9 @@ func (r *PGClusterReconciler) watchEnvFromSecrets() handler.TypedEventHandler[cl
 
 		var clusters v2.PerconaPGClusterList
 		if err := r.Client.List(ctx, &clusters, client.MatchingFields{
-			v2.IndexFieldEnvFromSecrets: secret.Name,
+			index: secret.Name,
 		}, client.InNamespace(secret.Namespace)); err != nil {
-			log.Error(err, "Failed to list clusters by env from secrets index failed", "key", client.ObjectKeyFromObject(secret).String())
+			log.Error(err, "Failed to list clusters by secret index", "key", client.ObjectKeyFromObject(secret).String())
 			return nil
 		}
 
@@ -342,6 +347,10 @@ func (r *PGClusterReconciler) Reconcile(ctx context.Context, request reconcile.R
 
 	if err := r.ensureFinalizers(ctx, cr); err != nil {
 		return reconcile.Result{}, errors.Wrap(err, "ensure finalizers")
+	}
+
+	if err := r.reconcilePatroniEtcd(ctx, cr); err != nil {
+		return reconcile.Result{}, errors.Wrap(err, "reconcile patroni etcd")
 	}
 
 	if err := r.reconcilePatroniVersionCheckPod(ctx, cr); err != nil {

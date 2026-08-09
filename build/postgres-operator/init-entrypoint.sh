@@ -12,6 +12,7 @@ install -o "$(id -u)" -g "$(id -g)" -m 0755 -D "/usr/local/bin/postgres-liveness
 install -o "$(id -u)" -g "$(id -g)" -m 0755 -D "/usr/local/bin/postgres-readiness-check.sh" "${CRUNCHY_BINDIR}/bin/postgres-readiness-check.sh"
 install -o "$(id -u)" -g "$(id -g)" -m 0755 -D "/usr/local/bin/relocate-extensions.sh" "${CRUNCHY_BINDIR}/bin/relocate-extensions.sh"
 install -o "$(id -u)" -g "$(id -g)" -m 0755 -D "/usr/local/bin/restore-command-wrapper.sh" "${CRUNCHY_BINDIR}/bin/restore-command-wrapper.sh"
+install -o "$(id -u)" -g "$(id -g)" -m 0755 -D "/usr/local/bin/patroni-role-change.sh" "${CRUNCHY_BINDIR}/bin/patroni-role-change.sh"
 
 # Distribute the log collector assets (entrypoint + fluent-bit/logrotate config)
 # into the shared bin volume so the log collector sidecars can run them without

@@ -1,0 +1,37 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+timeout: 300
+commands:
+  - script: |-
+      set -o errexit
+      set -o xtrace
+
+      source ../../functions
+
+      # Deleting the cluster must clear its state from etcd. The operator runs
+      # "patronictl remove" as a Job and holds the finalizer until it finishes,
+      # so the cluster going away is itself the signal that cleanup ran.
+      #
+      # etcd is deliberately still up here: step 99 tears it down afterwards,
+      # so that this check sees the real post-cleanup contents.
+      kubectl -n "${NAMESPACE}" delete pg etcd-dcs --wait=true --timeout=240s
+
+      for _ in $(seq 1 60); do
+        if ! kubectl -n "${NAMESPACE}" get postgrescluster etcd-dcs 2>/dev/null; then
+          break
+        fi
+        sleep 2
+      done
+
+      keys=$(kubectl -n "${NAMESPACE}" exec etcd-0 -- \
+        /usr/local/bin/etcdctl --endpoints=http://localhost:2379 \
+        get / --prefix --keys-only)
+
+      echo "keys remaining in etcd: ${keys}"
+
+      if echo "${keys}" | grep -q "etcd-dcs-ha"; then
+        echo "ERROR: Patroni state for etcd-dcs-ha is still in etcd after cluster deletion"
+        exit 1
+      fi
+
+      echo "OK: cluster state removed from etcd on teardown"

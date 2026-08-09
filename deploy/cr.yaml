@@ -857,6 +857,19 @@ spec:
 #    # - failureThreshold: leaderLeaseDurationSeconds / syncPeriodSeconds.
 #    syncPeriodSeconds: 10 # default: 10
 #    leaderLeaseDurationSeconds: 30 # default: 30
+#    # The distributed configuration store Patroni uses. Immutable after the
+#    # cluster is created: changing it would require every instance to restart
+#    # at once. Defaults to "kubernetes", which stores state in Endpoints.
+#    dcs:
+#      type: kubernetes # kubernetes or etcd
+#      # Required when type is etcd. Every endpoint must use the same scheme.
+#      etcd:
+#        endpoints:
+#        - "http://etcd.etcd-cluster.svc:2379"
+#        # Secret with ca.crt, tls.crt, and tls.key for mutual TLS with etcd.
+#        tlsSecret: etcd-tls
+#        # Secret with username and password for etcd authentication.
+#        authSecret: etcd-auth
 #    dynamicConfiguration:
 #      postgresql:
 #        parameters:

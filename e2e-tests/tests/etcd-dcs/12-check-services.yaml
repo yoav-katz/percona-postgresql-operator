@@ -1,0 +1,54 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+timeout: 120
+commands:
+  - script: |-
+      set -o errexit
+      set -o xtrace
+
+      source ../../functions
+
+      # Under etcd DCS nothing maintains the leader Endpoints, so the leader
+      # Service selects pods the callback script labelled instead. Its name and
+      # its spec.expose configuration must be identical to the Kubernetes DCS
+      # case, or exposing a cluster would depend on which DCS it uses.
+      selector=$(kubectl -n "${NAMESPACE}" get svc etcd-dcs-ha \
+        -o jsonpath='{.spec.selector}')
+
+      echo "${selector}" | grep -q '"postgres-operator.crunchydata.com/role":"primary"'
+      echo "${selector}" | grep -q '"postgres-operator.crunchydata.com/cluster":"etcd-dcs"'
+
+      # The primary Service still resolves through the leader Service, so the
+      # name applications connect to does not change with the DCS type.
+      leader_ip=$(kubectl -n "${NAMESPACE}" get svc etcd-dcs-ha -o jsonpath='{.spec.clusterIP}')
+      primary_ip=$(kubectl -n "${NAMESPACE}" get endpoints etcd-dcs-primary \
+        -o jsonpath='{.subsets[0].addresses[0].ip}')
+
+      if [ "${leader_ip}" != "${primary_ip}" ]; then
+        echo "ERROR: etcd-dcs-primary resolves to ${primary_ip}, expected the leader Service ${leader_ip}"
+        exit 1
+      fi
+
+      # Patroni owns no Service of its own here.
+      if kubectl -n "${NAMESPACE}" get svc etcd-dcs-config 2>/dev/null; then
+        echo "ERROR: the distributed configuration Service must not exist with etcd DCS"
+        exit 1
+      fi
+
+      # spec.expose must still reach the Service. Set a label and wait for it.
+      kubectl -n "${NAMESPACE}" patch pg etcd-dcs --type=merge -p \
+        '{"spec":{"expose":{"metadata":{"labels":{"e2e-expose-check":"applied"}}}}}'
+
+      for _ in $(seq 1 60); do
+        value=$(kubectl -n "${NAMESPACE}" get svc etcd-dcs-ha \
+          -o jsonpath='{.metadata.labels.e2e-expose-check}' || true)
+        if [ "${value}" = "applied" ]; then
+          echo "OK: spec.expose reaches the leader Service under etcd DCS"
+          exit 0
+        fi
+        sleep 2
+      done
+
+      echo "ERROR: spec.expose was dropped; the leader Service never received the label"
+      kubectl -n "${NAMESPACE}" get svc etcd-dcs-ha -o yaml
+      exit 1
