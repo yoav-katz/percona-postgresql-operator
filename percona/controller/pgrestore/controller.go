@@ -79,7 +79,7 @@ func (r *PGRestoreReconciler) Reconcile(ctx context.Context, request reconcile.R
 
 	if pgRestore.Spec.VolumeSnapshotBackupName != "" {
 		// Delegate to snapshot restore reconciliation
-		return snapshot.Reconcile(ctx, r.Client, r.PodExec, pgCluster, pgRestore)
+		return snapshot.Reconcile(ctx, r.Client, r.PodExec, r.Recorder, r.Owner, pgCluster, pgRestore)
 	}
 
 	if pgRestore.DeletionTimestamp != nil {

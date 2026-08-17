@@ -18,6 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -27,6 +28,7 @@ import (
 	"github.com/percona/percona-postgresql-operator/v2/internal/feature"
 	"github.com/percona/percona-postgresql-operator/v2/internal/logging"
 	"github.com/percona/percona-postgresql-operator/v2/internal/naming"
+	"github.com/percona/percona-postgresql-operator/v2/internal/patroni/dcs"
 	"github.com/percona/percona-postgresql-operator/v2/percona/controller"
 	restoreutils "github.com/percona/percona-postgresql-operator/v2/percona/controller/pgrestore/utils"
 	pNaming "github.com/percona/percona-postgresql-operator/v2/percona/naming"
@@ -42,6 +44,11 @@ type snapshotRestorer struct {
 	backup  *v2.PerconaPGBackup
 	restore *v2.PerconaPGRestore
 	podExec runtime.PodExecutor
+
+	// Set by Reconcile rather than newSnapshotRestorer; only clearLeaderLock
+	// needs them, and none of the tests that construct a restorer directly do.
+	recorder record.EventRecorder
+	owner    client.FieldOwner
 }
 
 func newSnapshotRestorer(
@@ -66,6 +73,8 @@ func Reconcile(
 	ctx context.Context,
 	c client.Client,
 	exec runtime.PodExecutor,
+	recorder record.EventRecorder,
+	owner client.FieldOwner,
 	pg *v2.PerconaPGCluster,
 	restore *v2.PerconaPGRestore,
 ) (reconcile.Result, error) {
@@ -82,6 +91,7 @@ func Reconcile(
 	}
 
 	r := newSnapshotRestorer(c, log, pg, backup, restore, exec)
+	r.recorder, r.owner = recorder, owner
 
 	if !restore.GetDeletionTimestamp().IsZero() {
 		if ok, err := r.runFinalizers(ctx); err != nil {
@@ -199,9 +209,14 @@ func (r *snapshotRestorer) reconcileRunning(ctx context.Context) (reconcile.Resu
 		return reconcile.Result{RequeueAfter: time.Second * 5}, nil
 	}
 
-	// Recreate DCS so that cluster can be bootstrapped with new data.
-	if err := r.reconcileLeaderEndpoints(ctx); err != nil {
-		return reconcile.Result{}, errors.Wrap(err, "reconcile leader endpoints")
+	// Clear the stale leader lock so the cluster can elect a leader against the
+	// restored data. A DCS outside Kubernetes needs a Job, so this can take
+	// several passes.
+	if ok, err := r.clearLeaderLock(ctx); err != nil {
+		return reconcile.Result{}, errors.Wrap(err, "clear leader lock")
+	} else if !ok {
+		r.log.Info("Waiting for the Patroni leader lock to be cleared")
+		return reconcile.Result{RequeueAfter: time.Second * 5}, nil
 	}
 
 	if ok, err := r.unsuspendAllInstances(ctx); err != nil {
@@ -415,43 +430,30 @@ func (r *snapshotRestorer) pvcSpecFromDataSource(
 	return dataVolSpec, nil
 }
 
-// reconcileLeaderEndpoints clears the stale Patroni leader lock so the cluster
-// can elect a new leader against the restored data.
+// clearLeaderLock removes the stale Patroni leader lock so the cluster can
+// elect a leader against the restored data. Instances are already suspended by
+// reconcileStarting, which is the backend's precondition.
 //
-// This only knows how to clear the lock when Patroni keeps it in a Kubernetes
-// Endpoints object. Under a DCS backend that keeps state elsewhere (e.g. etcd)
-// the lock would survive the restore, so refuse rather than restore onto state
-// that is about to contradict the data.
-// TODO(K8SPG-1057): clear it through dcs.Backend.ClearState, which already
-// knows how for every backend, and drop this restriction.
-func (r *snapshotRestorer) reconcileLeaderEndpoints(ctx context.Context) error {
-	if r.cluster.Spec.Patroni.DCSType() != crunchyv1beta1.PatroniDCSTypeKubernetes {
-		return errors.Errorf(
-			"snapshot restore is not supported with spec.patroni.dcs.type %q",
-			r.cluster.Spec.Patroni.DCSType())
+// Returns false while the backend needs another pass: a DCS that keeps its
+// state outside Kubernetes clears it with a Job.
+func (r *snapshotRestorer) clearLeaderLock(ctx context.Context) (bool, error) {
+	// The backend needs the whole spec, not just the name: which backend to
+	// use, and for etcd the connection settings and the images its Job runs.
+	postgresCluster := &crunchyv1beta1.PostgresCluster{}
+	if err := r.cl.Get(ctx, types.NamespacedName{
+		Name:      r.cluster.Name,
+		Namespace: r.cluster.Namespace,
+	}, postgresCluster); err != nil {
+		return false, errors.Wrap(err, "get postgrescluster")
 	}
 
-	postgresCluster := &crunchyv1beta1.PostgresCluster{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      r.cluster.Name,
-			Namespace: r.cluster.Namespace,
-		},
+	cleanup, err := dcs.For(postgresCluster).ClearLeader(
+		ctx, r.cl, postgresCluster, string(r.restore.GetUID()))
+	if err != nil {
+		return false, errors.Wrap(err, "clear leader lock")
 	}
 
-	//nolint:staticcheck
-	leaderEp := &corev1.Endpoints{ObjectMeta: naming.PatroniLeaderEndpoints(postgresCluster)}
-	if err := r.cl.Get(ctx, client.ObjectKeyFromObject(leaderEp), leaderEp); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-
-	if len(leaderEp.Subsets) > 0 {
-		return nil
-	}
-
-	if err := r.cl.Delete(ctx, leaderEp); client.IgnoreNotFound(err) != nil {
-		return errors.Wrap(err, "delete leader endpoints")
-	}
-	return nil
+	return dcs.ApplyStateCleanup(ctx, r.cl, r.recorder, r.owner, r.restore, cleanup)
 }
 
 func (r *snapshotRestorer) suspendAllInstances(ctx context.Context) (bool, error) {

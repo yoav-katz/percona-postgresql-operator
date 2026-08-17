@@ -1258,7 +1258,7 @@ func (r *Reconciler) prepareForRestore(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	cleared, err := r.applyStateCleanup(ctx, cluster, cleanup)
+	cleared, err := dcs.ApplyStateCleanup(ctx, r.Client, r.Recorder, r.Owner, cluster, cleanup)
 	if err != nil {
 		return err
 	}

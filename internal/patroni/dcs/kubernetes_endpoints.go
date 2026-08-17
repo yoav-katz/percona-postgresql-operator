@@ -259,6 +259,33 @@ func (kubernetesEndpointsBackend) ClearState(
 	return cleanup, nil
 }
 
+// ClearLeader deletes the Endpoints object holding the leader lock, and
+// nothing else: the distributed configuration and the "initialize" key live in
+// a separate object here, so a cluster that keeps its identity across a
+// restore keeps them too.
+func (kubernetesEndpointsBackend) ClearLeader(
+	ctx context.Context, cli client.Client, cluster *v1beta1.PostgresCluster, _ string,
+) (StateCleanup, error) {
+	var cleanup StateCleanup
+
+	endpoints := &corev1.Endpoints{ObjectMeta: naming.PatroniLeaderEndpoints(cluster)}
+	err := cli.Get(ctx, client.ObjectKeyFromObject(endpoints), endpoints)
+	if apierrors.IsNotFound(err) {
+		return StateCleanup{Cleared: true}, nil
+	}
+	if err != nil {
+		return cleanup, errors.WithStack(err)
+	}
+
+	// Patroni has members registered here, so the lock is not stale.
+	if len(endpoints.Subsets) > 0 {
+		return StateCleanup{Cleared: true}, nil
+	}
+
+	cleanup.Delete = append(cleanup.Delete, endpoints)
+	return cleanup, nil
+}
+
 func (kubernetesEndpointsBackend) Delete(
 	ctx context.Context, cli client.Client, cluster *v1beta1.PostgresCluster,
 ) (StateCleanup, error) {

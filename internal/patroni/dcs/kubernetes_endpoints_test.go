@@ -443,6 +443,78 @@ func TestKubernetesEndpointsClearState(t *testing.T) {
 	})
 }
 
+// TestKubernetesEndpointsClearLeader covers the leader lock teardown that used
+// to live inline in the snapshot restore path. Unlike ClearState it must touch
+// the leader Endpoints and nothing else, so a cluster that keeps its identity
+// across a restore keeps its configuration too.
+func TestKubernetesEndpointsClearLeader(t *testing.T) {
+	_, cc := require.Kubernetes2(t)
+	require.ParallelCapacity(t, 0)
+	ns := require.Namespace(t, cc)
+	ctx := context.Background()
+
+	cluster := new(v1beta1.PostgresCluster)
+	cluster.Namespace = ns.Name
+	cluster.Name = "clear-leader-test"
+
+	// createLeader replaces the leader Endpoints, with subsets when addressed.
+	createLeader := func(t *testing.T, addressed bool) *corev1.Endpoints {
+		t.Helper()
+
+		endpoints := &corev1.Endpoints{ObjectMeta: naming.PatroniLeaderEndpoints(cluster)}
+		assert.Check(t, client.IgnoreNotFound(cc.Delete(ctx, endpoints)))
+
+		endpoints = &corev1.Endpoints{ObjectMeta: naming.PatroniLeaderEndpoints(cluster)}
+		if addressed {
+			endpoints.Subsets = []corev1.EndpointSubset{{
+				Addresses: []corev1.EndpointAddress{{IP: "10.0.0.1"}},
+				Ports:     []corev1.EndpointPort{{Name: "postgres", Port: 5432}},
+			}}
+		}
+		assert.NilError(t, cc.Create(ctx, endpoints))
+		return endpoints
+	}
+
+	t.Run("nothing to clear", func(t *testing.T) {
+		cleanup, err := (kubernetesEndpointsBackend{}).ClearLeader(ctx, cc, cluster, "some-restore")
+		assert.NilError(t, err)
+		assert.Assert(t, cleanup.Cleared)
+		assert.Assert(t, len(cleanup.Delete) == 0)
+		assert.Assert(t, cleanup.Apply == nil)
+	})
+
+	t.Run("leaves an addressed lock alone", func(t *testing.T) {
+		createLeader(t, true)
+
+		cleanup, err := (kubernetesEndpointsBackend{}).ClearLeader(ctx, cc, cluster, "some-restore")
+		assert.NilError(t, err)
+		assert.Assert(t, cleanup.Cleared, "members are registered, so the lock is not stale")
+		assert.Assert(t, len(cleanup.Delete) == 0)
+	})
+
+	t.Run("clears a stale lock", func(t *testing.T) {
+		leader := createLeader(t, false)
+
+		// Objects ClearState would take but ClearLeader must not.
+		for _, meta := range []metav1.ObjectMeta{
+			naming.PatroniDistributedConfiguration(cluster),
+			naming.PatroniTrigger(cluster),
+		} {
+			endpoints := &corev1.Endpoints{ObjectMeta: meta}
+			assert.Check(t, client.IgnoreAlreadyExists(cc.Create(ctx, endpoints)))
+		}
+
+		cleanup, err := (kubernetesEndpointsBackend{}).ClearLeader(ctx, cc, cluster, "some-restore")
+		assert.NilError(t, err)
+		assert.Assert(t, !cleanup.Cleared)
+		assert.Assert(t, cleanup.Apply == nil, "the Kubernetes backend applies nothing")
+
+		assert.Equal(t, len(cleanup.Delete), 1,
+			"expected only the leader Endpoints, not the ClearState set")
+		assert.Equal(t, cleanup.Delete[0].GetName(), leader.Name)
+	})
+}
+
 // TestKubernetesEndpointsPollInterval asserts the Kubernetes backend never
 // asks for a poll: Patroni writes its state into Kubernetes, and watches turn
 // those writes into reconciles.

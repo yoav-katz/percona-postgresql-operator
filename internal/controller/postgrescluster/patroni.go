@@ -36,38 +36,7 @@ func (r *Reconciler) deletePatroniArtifacts(
 	if err != nil {
 		return false, err
 	}
-	return r.applyStateCleanup(ctx, cluster, cleanup)
-}
-
-// applyStateCleanup carries out the work a DCS backend asked for and reports
-// whether the backend considers its state cleared. Backends only read; every
-// write they want goes through here so ownership, apply, and event recording
-// stay in one place.
-func (r *Reconciler) applyStateCleanup(
-	ctx context.Context, cluster *v1beta1.PostgresCluster, cleanup dcs.StateCleanup,
-) (bool, error) {
-	if warning := cleanup.Warning; warning != nil {
-		r.Recorder.Eventf(cluster, corev1.EventTypeWarning, warning.Reason, "%s", warning.Message)
-	}
-
-	for _, object := range cleanup.Delete {
-		if err := r.Client.Delete(ctx, object,
-			client.PropagationPolicy(metav1.DeletePropagationBackground),
-		); client.IgnoreNotFound(err) != nil {
-			return false, errors.WithStack(err)
-		}
-	}
-
-	if cleanup.Apply != nil {
-		if err := r.setControllerReference(cluster, cleanup.Apply); err != nil {
-			return false, errors.WithStack(err)
-		}
-		if err := r.apply(ctx, cleanup.Apply); err != nil {
-			return false, errors.WithStack(err)
-		}
-	}
-
-	return cleanup.Cleared, nil
+	return dcs.ApplyStateCleanup(ctx, r.Client, r.Recorder, r.Owner, cluster, cleanup)
 }
 
 // podExecutor returns a patroni.Executor that runs commands in pod's database

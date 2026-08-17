@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -904,6 +905,136 @@ func TestReconcileTablespaceVolumes(t *testing.T) {
 
 		r := newSnapshotRestorer(cl, logging.Discard(), cluster, backup, restore, noopPodExecutor)
 		ok, err := r.reconcileTablespaceVolumes(ctx, instance)
+		require.NoError(t, err)
+		assert.True(t, ok)
+	})
+}
+
+func TestClearLeaderLock(t *testing.T) {
+	ctx := context.Background()
+	ns := "test-ns"
+	clusterName := "my-cluster"
+
+	s := scheme.Scheme
+	require.NoError(t, corev1.AddToScheme(s))
+	require.NoError(t, batchv1.AddToScheme(s))
+	require.NoError(t, v2.AddToScheme(s))
+	require.NoError(t, crunchyv1beta1.AddToScheme(s))
+
+	cluster := &v2.PerconaPGCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: ns},
+	}
+	restore := &v2.PerconaPGRestore{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "my-restore", Namespace: ns, UID: "restore-uid",
+		},
+		Spec: v2.PerconaPGRestoreSpec{PGCluster: clusterName},
+	}
+
+	// postgresCluster returns the object the restorer looks up, configured for
+	// the given DCS backend. The etcd variant carries everything its cleanup
+	// Job is built from.
+	postgresCluster := func(etcd bool) *crunchyv1beta1.PostgresCluster {
+		pg := &crunchyv1beta1.PostgresCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: ns},
+			Spec: crunchyv1beta1.PostgresClusterSpec{
+				Image:           "postgres:16",
+				PostgresVersion: 16,
+			},
+		}
+		if etcd {
+			pg.Spec.Patroni = &crunchyv1beta1.PatroniSpec{
+				DCS: &crunchyv1beta1.PatroniDCS{
+					Type: crunchyv1beta1.PatroniDCSTypeEtcd,
+					Etcd: &crunchyv1beta1.PatroniEtcdSpec{
+						Endpoints: []string{"http://etcd.etcd-cluster.svc:2379"},
+					},
+				},
+			}
+			pg.Status.StartupInstance = clusterName + "-00-abcd"
+		}
+		return pg
+	}
+
+	newRestorer := func(cl client.Client) *snapshotRestorer {
+		r := newSnapshotRestorer(cl, logging.Discard(), cluster, nil, restore, noopPodExecutor)
+		r.recorder, r.owner = record.NewFakeRecorder(10), client.FieldOwner("test")
+		return r
+	}
+
+	t.Run("kubernetes: clears a stale lock, then reports done", func(t *testing.T) {
+		pg := postgresCluster(false)
+		leader := &corev1.Endpoints{ObjectMeta: naming.PatroniLeaderEndpoints(pg)}
+
+		cl := fake.NewClientBuilder().WithScheme(s).
+			WithObjects(cluster, restore, pg, leader).Build()
+
+		r := newRestorer(cl)
+
+		ok, err := r.clearLeaderLock(ctx)
+		require.NoError(t, err)
+		assert.False(t, ok, "the delete has to land before we call it cleared")
+
+		err = cl.Get(ctx, client.ObjectKeyFromObject(leader), leader)
+		assert.True(t, k8serrors.IsNotFound(err), "expected it deleted, got %v", err)
+
+		ok, err = r.clearLeaderLock(ctx)
+		require.NoError(t, err)
+		assert.True(t, ok)
+	})
+
+	t.Run("kubernetes: leaves an addressed lock alone", func(t *testing.T) {
+		pg := postgresCluster(false)
+		leader := &corev1.Endpoints{ObjectMeta: naming.PatroniLeaderEndpoints(pg)}
+		leader.Subsets = []corev1.EndpointSubset{{
+			Addresses: []corev1.EndpointAddress{{IP: "10.0.0.1"}},
+		}}
+
+		cl := fake.NewClientBuilder().WithScheme(s).
+			WithObjects(cluster, restore, pg, leader).Build()
+
+		ok, err := newRestorer(cl).clearLeaderLock(ctx)
+		require.NoError(t, err)
+		assert.True(t, ok)
+
+		require.NoError(t, cl.Get(ctx, client.ObjectKeyFromObject(leader), leader),
+			"an addressed lock must survive")
+	})
+
+	t.Run("etcd: runs a Job owned by the restore", func(t *testing.T) {
+		pg := postgresCluster(true)
+		instance := &metav1.ObjectMeta{Namespace: ns, Name: pg.Status.StartupInstance}
+
+		cl := fake.NewClientBuilder().WithScheme(s).WithObjects(
+			cluster, restore, pg,
+			&corev1.ConfigMap{ObjectMeta: naming.ClusterConfigMap(pg)},
+			&corev1.ConfigMap{ObjectMeta: naming.InstanceConfigMap(instance)},
+			&corev1.Secret{ObjectMeta: naming.InstanceCertificates(instance)},
+		).Build()
+
+		ok, err := newRestorer(cl).clearLeaderLock(ctx)
+		require.NoError(t, err)
+		assert.False(t, ok, "the Job has to finish first")
+
+		job := &batchv1.Job{ObjectMeta: naming.PatroniDCSCleanupJob(pg)}
+		require.NoError(t, cl.Get(ctx, client.ObjectKeyFromObject(job), job))
+
+		controller := metav1.GetControllerOf(job)
+		require.NotNil(t, controller)
+		assert.Equal(t, restore.Name, controller.Name)
+		assert.Equal(t, "PerconaPGRestore", controller.Kind)
+
+		// Keyed on this restore, so a later one does not reuse the result.
+		assert.Equal(t, string(restore.UID),
+			job.Annotations["postgres-operator.crunchydata.com/patroni-dcs-cleanup-restore-id"])
+
+		// Once it succeeds the step is done.
+		job.Status.Conditions = []batchv1.JobCondition{{
+			Type: batchv1.JobComplete, Status: corev1.ConditionTrue,
+		}}
+		require.NoError(t, cl.Status().Update(ctx, job))
+
+		ok, err = newRestorer(cl).clearLeaderLock(ctx)
 		require.NoError(t, err)
 		assert.True(t, ok)
 	})

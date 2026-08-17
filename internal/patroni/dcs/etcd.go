@@ -345,6 +345,16 @@ func (b etcdBackend) ClearState(
 	return cleanup, nil
 }
 
+// ClearLeader clears the leader lock the only way etcd can: "patronictl
+// remove", which also drops the member keys and the "initialize" key. A
+// cluster restored under this backend therefore re-registers itself with etcd
+// from its restored data directory.
+func (b etcdBackend) ClearLeader(
+	ctx context.Context, cli client.Client, cluster *v1beta1.PostgresCluster, restoreID string,
+) (StateCleanup, error) {
+	return b.ClearState(ctx, cli, cluster, restoreID)
+}
+
 // Delete clears cluster's state from etcd on teardown, using the same Job as
 // ClearState. Unlike ClearState it gives up rather than retrying forever: a
 // cluster that cannot finish deleting is a worse outcome than leftover keys in

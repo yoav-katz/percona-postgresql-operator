@@ -457,6 +457,44 @@ func TestEtcdClearState(t *testing.T) {
 	})
 }
 
+// TestEtcdClearLeaderMatchesClearState asserts the delegation: "patronictl
+// remove" is the only lever etcd has, so clearing the leader lock clears
+// everything ClearState does.
+func TestEtcdClearLeaderMatchesClearState(t *testing.T) {
+	_, cc := require.Kubernetes2(t)
+	require.ParallelCapacity(t, 0)
+	ns := require.Namespace(t, cc)
+	ctx := context.Background()
+
+	cluster := etcdCluster(t)
+	cluster.Namespace = ns.Name
+	cluster.Status.StartupInstance = "cluster-name-abcd"
+
+	for _, object := range []client.Object{
+		&corev1.ConfigMap{ObjectMeta: naming.ClusterConfigMap(cluster)},
+		&corev1.ConfigMap{ObjectMeta: naming.InstanceConfigMap(&metav1.ObjectMeta{
+			Namespace: ns.Name, Name: "cluster-name-abcd",
+		})},
+		&corev1.Secret{ObjectMeta: naming.InstanceCertificates(&metav1.ObjectMeta{
+			Namespace: ns.Name, Name: "cluster-name-abcd",
+		})},
+	} {
+		assert.NilError(t, cc.Create(ctx, object))
+	}
+
+	backend := etcdBackend{}
+
+	leader, err := backend.ClearLeader(ctx, cc, cluster, "restore-one")
+	assert.NilError(t, err)
+
+	state, err := backend.ClearState(ctx, cc, cluster, "restore-one")
+	assert.NilError(t, err)
+
+	assert.Equal(t, leader.Cleared, state.Cleared)
+	assert.Equal(t, len(leader.Delete), len(state.Delete))
+	assert.DeepEqual(t, leader.Apply, state.Apply)
+}
+
 // TestEtcdDeleteGivesUp asserts teardown never blocks on etcd: leftover keys
 // in a store the operator does not own beat a cluster that cannot be deleted.
 func TestEtcdDeleteGivesUp(t *testing.T) {
