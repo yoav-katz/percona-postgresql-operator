@@ -78,14 +78,21 @@ commands:
           exit 1
       fi
 
-      # Exactly the two client identities move to the internal issuer.
+      # Certificate Ready may still describe the pre-patch generation, so wait
+      # until the issued Secret itself has converged to the internal CA.
       for cert in cert-manager-tls-replication-cert cert-manager-tls-pgbackrest-client-cert; do
-          kubectl -n "$NAMESPACE" wait --for=condition=Ready "certificate/${cert}" --timeout=120s
-
-          issuer_name=$(kubectl -n "$NAMESPACE" get certificate "$cert" -o jsonpath='{.spec.issuerRef.name}')
-          issuer_kind=$(kubectl -n "$NAMESPACE" get certificate "$cert" -o jsonpath='{.spec.issuerRef.kind}')
-          if [[ "$issuer_name" != "$internal_issuer_name" || "$issuer_kind" != "Issuer" ]]; then
-              echo "$cert should reference the internal Issuer, got name=$issuer_name kind=$issuer_kind"
+          converged=0
+          for _ in $(seq 1 24); do
+              issuer=$(kubectl -n "$NAMESPACE" get secret "$cert" \
+                -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -issuer)
+              if [[ "$issuer" == *"CN=cert-manager-tls-internal-ca"* ]]; then
+                  converged=1
+                  break
+              fi
+              sleep 5
+          done
+          if [[ "$converged" -ne 1 ]]; then
+              echo "$cert was not reissued by the internal CA"
               exit 1
           fi
       done
