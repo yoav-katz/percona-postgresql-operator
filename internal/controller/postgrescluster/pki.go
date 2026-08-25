@@ -633,7 +633,7 @@ func (r *Reconciler) isRootCACertManagerManaged(ctx context.Context, cluster *v1
 
 	if mode != certmanager.IssuerModeManagedNamespaced {
 		if !useCertManager {
-			return false, errors.New("cert-manager is required when spec.tls.issuerConf is set")
+			return false, errors.New("cert-manager is required when spec.tls.issuerConf or spec.tls.internalIssuerConf is set")
 		}
 		return true, nil
 	}
@@ -744,8 +744,17 @@ func (r *Reconciler) reconcileCABundleSecret(
 	ctx context.Context, cluster *v1beta1.PostgresCluster,
 ) (*corev1.SecretProjection, error) {
 	additionalCAs, err := r.additionalTrustedCAs(ctx, cluster)
-	if err != nil || len(additionalCAs) == 0 {
+	if err != nil {
 		return nil, err
+	}
+
+	// A separate internal issuer signs the cluster and replication certificates
+	// with different CAs, and each of the two files this Secret feeds has to
+	// verify against both: ssl_ca_file checks the _crunchyrepl client cert
+	// issued by the internal one, while the replication sslrootcert checks the
+	// server cert issued by the other.
+	if len(additionalCAs) == 0 && cluster.Spec.TLS.GetInternalIssuerConf() == nil {
+		return nil, nil
 	}
 
 	// A user-provided Secret is not ours to merge into, and the internal PKI

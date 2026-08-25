@@ -14004,6 +14004,17 @@ spec:
                     type: string
                   certValidityDuration:
                     type: string
+                  internalIssuerConf:
+                    properties:
+                      group:
+                        type: string
+                      kind:
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - name
+                    type: object
                   issuerConf:
                     properties:
                       group:
@@ -14018,6 +14029,9 @@ spec:
                   pgBackRestCertValidityDuration:
                     type: string
                 type: object
+                x-kubernetes-validations:
+                - message: internalIssuerConf requires issuerConf
+                  rule: '!has(self.internalIssuerConf) || has(self.issuerConf)'
               tlsOnly:
                 type: boolean
               userInterface:

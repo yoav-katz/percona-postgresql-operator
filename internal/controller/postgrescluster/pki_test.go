@@ -1572,6 +1572,51 @@ func TestReconcileCABundleSecret(t *testing.T) {
 		assert.DeepEqual(t, before.Data, after.Data)
 	})
 
+	t.Run("ActivatesForInternalIssuerConfAlone", func(t *testing.T) {
+		// With two issuers the cluster and replication certificates carry
+		// different CAs, and each of the two files needs both — so the bundle
+		// has to activate even with no additionalTrustedCAs.
+		cluster := newCluster()
+		cluster.Spec.TLS.InternalIssuerConf = &cmmeta.IssuerReference{
+			Name: "pg-internal", Kind: cmv1.IssuerKind,
+		}
+		r := newReconciler(
+			secret(naming.PostgresTLSSecret(cluster), clusterCA),
+			secret(naming.ReplicationClientCertSecret(cluster), replicationCA),
+		)
+
+		projection, err := r.reconcileCABundleSecret(ctx, cluster)
+		assert.NilError(t, err)
+		assert.Assert(t, projection != nil)
+
+		bundle := new(corev1.Secret)
+		assert.NilError(t, r.Client.Get(ctx, client.ObjectKey{
+			Namespace: cluster.Namespace, Name: cluster.Name + "-ca-bundle",
+		}, bundle))
+		assert.DeepEqual(t, bundle.Data["ca.crt"],
+			append(append([]byte{}, clusterCA...), replicationCA...))
+	})
+
+	t.Run("InternalIssuerConfMatchingIssuerConfCollapses", func(t *testing.T) {
+		// Pointing both fields at the same issuer signs both certificates with
+		// one CA, so the bundle is a single certificate and the split is inert.
+		cluster := newCluster()
+		cluster.Spec.TLS.InternalIssuerConf = cluster.Spec.TLS.IssuerConf
+		r := newReconciler(
+			secret(naming.PostgresTLSSecret(cluster), clusterCA),
+			secret(naming.ReplicationClientCertSecret(cluster), clusterCA),
+		)
+
+		_, err := r.reconcileCABundleSecret(ctx, cluster)
+		assert.NilError(t, err)
+
+		bundle := new(corev1.Secret)
+		assert.NilError(t, r.Client.Get(ctx, client.ObjectKey{
+			Namespace: cluster.Namespace, Name: cluster.Name + "-ca-bundle",
+		}, bundle))
+		assert.DeepEqual(t, bundle.Data["ca.crt"], clusterCA)
+	})
+
 	t.Run("DuplicateCAsAreNotRepeated", func(t *testing.T) {
 		// The cluster and replication Secrets normally share one issuer.
 		cluster := newCluster("extra")

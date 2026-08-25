@@ -79,4 +79,9 @@ commands:
         exit 1
       fi
 
+      if kubectl -n "$NAMESPACE" get issuer cert-management-policy-ignored-internal-issuer >/dev/null 2>&1; then
+        echo "operatorProvidedOnly created the Issuer from internalIssuerConf" >&2
+        exit 1
+      fi
+
     timeout: 300

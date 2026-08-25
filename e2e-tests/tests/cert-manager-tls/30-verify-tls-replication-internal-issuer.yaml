@@ -1,0 +1,24 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+  - script: |-
+      set -o errexit
+      set -o xtrace
+
+      source ../../functions
+
+      # This is the assertion that the split trust chain actually holds. The
+      # "_crunchyrepl" client certificate is now signed by the internal CA
+      # while the server certificate is signed by the external one, so
+      # replication only works if ssl_ca_file and the replication sslrootcert
+      # both received the merged bundle.
+      repl_ssl_count=$(run_psql_local \
+        "SELECT count(*) FROM pg_stat_ssl s JOIN pg_stat_replication r ON s.pid = r.pid WHERE s.ssl = true;" \
+        "postgres:$(get_psql_user_pass cert-manager-tls-pguser-postgres)@cert-manager-tls-primary")
+      repl_ssl_count=$(echo "$repl_ssl_count" | tr -d '[:space:]')
+
+      if [[ "$repl_ssl_count" -lt 1 ]]; then
+          echo "No SSL replication connections found after switching to the internal Issuer, got: $repl_ssl_count"
+          exit 1
+      fi
+    timeout: 60

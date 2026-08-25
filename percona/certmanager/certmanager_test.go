@@ -1375,7 +1375,7 @@ func TestResolveIssuerMode(t *testing.T) {
 func TestIssuerRef(t *testing.T) {
 	t.Run("managed namespaced without issuerConf uses generated name", func(t *testing.T) {
 		cluster := testCluster()
-		ref := issuerRef(cluster, IssuerModeManagedNamespaced)
+		ref := issuerRef(cluster, IssuerModeManagedNamespaced, false)
 		assert.Equal(t, naming.TLSIssuer(cluster).Name, ref.Name)
 		assert.Equal(t, v1.IssuerKind, ref.Kind)
 		assert.Equal(t, certmanager.GroupName, ref.Group)
@@ -1386,7 +1386,7 @@ func TestIssuerRef(t *testing.T) {
 		cluster.Spec.TLS = &v1beta1.TLSSpec{
 			IssuerConf: &cmmeta.IssuerReference{Name: "custom-tls-issuer"},
 		}
-		ref := issuerRef(cluster, IssuerModeManagedNamespaced)
+		ref := issuerRef(cluster, IssuerModeManagedNamespaced, false)
 		assert.Equal(t, "custom-tls-issuer", ref.Name)
 		assert.Equal(t, v1.IssuerKind, ref.Kind)
 	})
@@ -1396,7 +1396,7 @@ func TestIssuerRef(t *testing.T) {
 		cluster.Spec.TLS = &v1beta1.TLSSpec{
 			IssuerConf: &cmmeta.IssuerReference{Name: "shared-issuer", Kind: v1.ClusterIssuerKind},
 		}
-		ref := issuerRef(cluster, IssuerModeManagedCluster)
+		ref := issuerRef(cluster, IssuerModeManagedCluster, false)
 		assert.Equal(t, "shared-issuer", ref.Name)
 		assert.Equal(t, v1.ClusterIssuerKind, ref.Kind)
 	})
@@ -1406,7 +1406,7 @@ func TestIssuerRef(t *testing.T) {
 		cluster.Spec.TLS = &v1beta1.TLSSpec{
 			IssuerConf: &cmmeta.IssuerReference{Name: "vault-issuer", Kind: "VaultClusterIssuer"},
 		}
-		ref := issuerRef(cluster, IssuerModeExternal)
+		ref := issuerRef(cluster, IssuerModeExternal, false)
 		assert.Equal(t, "vault-issuer", ref.Name)
 		assert.Equal(t, "VaultClusterIssuer", ref.Kind)
 		assert.Equal(t, "cert-manager.io", ref.Group)
@@ -1417,8 +1417,68 @@ func TestIssuerRef(t *testing.T) {
 		cluster.Spec.TLS = &v1beta1.TLSSpec{
 			IssuerConf: &cmmeta.IssuerReference{Name: "vault-issuer", Kind: "VaultClusterIssuer", Group: "vault.example.com"},
 		}
-		ref := issuerRef(cluster, IssuerModeExternal)
+		ref := issuerRef(cluster, IssuerModeExternal, false)
 		assert.Equal(t, "vault.example.com", ref.Group)
+	})
+
+	withInternal := func(internal *cmmeta.IssuerReference) *v1beta1.PostgresCluster {
+		cluster := testCluster()
+		cluster.Spec.TLS = &v1beta1.TLSSpec{
+			IssuerConf:         &cmmeta.IssuerReference{Name: "acme-issuer", Kind: v1.ClusterIssuerKind},
+			InternalIssuerConf: internal,
+		}
+		return cluster
+	}
+
+	t.Run("internal client uses internalIssuerConf verbatim", func(t *testing.T) {
+		cluster := withInternal(&cmmeta.IssuerReference{Name: "pg-internal", Kind: v1.IssuerKind})
+		ref := issuerRef(cluster, IssuerModeExternal, true)
+		assert.Equal(t, "pg-internal", ref.Name)
+		assert.Equal(t, v1.IssuerKind, ref.Kind)
+		assert.Equal(t, certmanager.GroupName, ref.Group)
+	})
+
+	t.Run("internal client preserves explicit kind and group", func(t *testing.T) {
+		cluster := withInternal(&cmmeta.IssuerReference{
+			Name: "vault-internal", Kind: "VaultIssuer", Group: "vault.example.com",
+		})
+		ref := issuerRef(cluster, IssuerModeExternal, true)
+		assert.Equal(t, "vault-internal", ref.Name)
+		assert.Equal(t, "VaultIssuer", ref.Kind)
+		assert.Equal(t, "vault.example.com", ref.Group)
+	})
+
+	t.Run("internalIssuerConf never applies to server certificates", func(t *testing.T) {
+		// The whole point of the split: everything that is not one of the two
+		// client identities stays on issuerConf.
+		cluster := withInternal(&cmmeta.IssuerReference{Name: "pg-internal", Kind: v1.IssuerKind})
+		ref := issuerRef(cluster, IssuerModeExternal, false)
+		assert.Equal(t, "acme-issuer", ref.Name)
+		assert.Equal(t, v1.ClusterIssuerKind, ref.Kind)
+	})
+
+	t.Run("internal client falls back to issuerConf when unset", func(t *testing.T) {
+		// Omitting the field has to be byte-identical to the old behaviour, in
+		// every mode.
+		for _, mode := range []IssuerMode{
+			IssuerModeManagedNamespaced, IssuerModeManagedCluster, IssuerModeExternal,
+		} {
+			cluster := withInternal(nil)
+			assert.Equal(t, issuerRef(cluster, mode, false), issuerRef(cluster, mode, true))
+		}
+	})
+
+	t.Run("internalIssuerConf wins over the mode", func(t *testing.T) {
+		// It is reference-only, so a managed mode does not rewrite it into the
+		// operator's own issuer.
+		cluster := withInternal(&cmmeta.IssuerReference{Name: "pg-internal"})
+		for _, mode := range []IssuerMode{
+			IssuerModeManagedNamespaced, IssuerModeManagedCluster, IssuerModeExternal,
+		} {
+			ref := issuerRef(cluster, mode, true)
+			assert.Equal(t, "pg-internal", ref.Name)
+			assert.Empty(t, ref.Kind, "kind is passed through, not defaulted")
+		}
 	})
 }
 
@@ -1528,5 +1588,131 @@ func TestApplyCertificateIssuerRefDrift(t *testing.T) {
 		cert := &v1.Certificate{}
 		require.NoError(t, client.Get(t.Context(), sigs.ObjectKey{Namespace: cluster.Namespace, Name: cluster.Name + "-pgbackrest-repo-cert"}, cert))
 		assert.Equal(t, "vault-issuer", cert.Spec.IssuerRef.Name)
+	})
+}
+
+// TestInternalIssuerConfSplit asserts the whole point of internalIssuerConf: the
+// two client identities an ACME issuer cannot sign move to the internal issuer,
+// and nothing else does.
+func TestInternalIssuerConfSplit(t *testing.T) {
+	newCluster := func(name string) *v1beta1.PostgresCluster {
+		cluster := testCluster()
+		cluster.Name = name
+		cluster.Spec.TLS = &v1beta1.TLSSpec{
+			IssuerConf: &cmmeta.IssuerReference{
+				Name: "letsencrypt", Kind: v1.ClusterIssuerKind,
+			},
+			InternalIssuerConf: &cmmeta.IssuerReference{
+				Name: "postgres-internal", Kind: v1.IssuerKind,
+			},
+		}
+		return cluster
+	}
+
+	// A ClusterIssuer the operator did not create resolves to IssuerModeExternal,
+	// which is the mode an ACME issuerConf actually runs in.
+	setup := func(t *testing.T, cluster *v1beta1.PostgresCluster) (sigs.Client, Controller) {
+		t.Helper()
+		client := setupFakeClient(t, cluster, &v1.ClusterIssuer{
+			ObjectMeta: metav1.ObjectMeta{Name: "letsencrypt"},
+		})
+		return client, NewController(client, client.Scheme(), false)
+	}
+
+	getCert := func(t *testing.T, client sigs.Client, ns, name string) *v1.Certificate {
+		t.Helper()
+		cert := &v1.Certificate{}
+		require.NoError(t, client.Get(t.Context(), sigs.ObjectKey{Namespace: ns, Name: name}, cert))
+		return cert
+	}
+
+	t.Run("replication client uses the internal issuer", func(t *testing.T) {
+		cluster := newCluster("split-repl")
+		client, ctrl := setup(t, cluster)
+
+		require.NoError(t, ctrl.ApplyReplicationCertificate(t.Context(), cluster))
+
+		cert := getCert(t, client, cluster.Namespace, cluster.Name+"-replication-cert")
+		assert.Equal(t, "postgres-internal", cert.Spec.IssuerRef.Name)
+		assert.Equal(t, v1.IssuerKind, cert.Spec.IssuerRef.Kind)
+		assert.Equal(t, certmanager.GroupName, cert.Spec.IssuerRef.Group)
+		// The identity itself must not be reshaped to suit the issuer.
+		assert.Equal(t, "_crunchyrepl", cert.Spec.CommonName)
+	})
+
+	t.Run("pgbackrest client uses the internal issuer", func(t *testing.T) {
+		cluster := newCluster("split-pgbr")
+		client, ctrl := setup(t, cluster)
+
+		require.NoError(t, ctrl.ApplyPGBackRestClientCertificate(t.Context(), cluster))
+
+		cert := getCert(t, client, cluster.Namespace, cluster.Name+"-pgbackrest-client-cert")
+		assert.Equal(t, "postgres-internal", cert.Spec.IssuerRef.Name)
+		assert.Equal(t, v1.IssuerKind, cert.Spec.IssuerRef.Kind)
+		assert.Equal(t, "pgbackrest@"+string(cluster.GetUID()), cert.Spec.CommonName)
+	})
+
+	t.Run("server certificates stay on issuerConf", func(t *testing.T) {
+		cluster := newCluster("split-servers")
+		client, ctrl := setup(t, cluster)
+		ctx := t.Context()
+		dnsNames := []string{"some-host.example.com"}
+
+		require.NoError(t, ctrl.ApplyClusterCertificate(ctx, cluster, dnsNames))
+		require.NoError(t, ctrl.ApplyInstanceCertificate(ctx, cluster, cluster.Name+"-inst", dnsNames))
+		require.NoError(t, ctrl.ApplyPGBouncerCertificate(ctx, cluster, dnsNames))
+		require.NoError(t, ctrl.ApplyPGBackRestRepoCertificate(ctx, cluster, dnsNames))
+
+		for _, name := range []string{
+			cluster.Name + "-cluster-cert",
+			cluster.Name + "-inst-cert",
+			cluster.Name + "-pgbouncer-cert",
+			cluster.Name + "-pgbackrest-repo-cert",
+		} {
+			cert := getCert(t, client, cluster.Namespace, name)
+			assert.Equal(t, "letsencrypt", cert.Spec.IssuerRef.Name, name)
+			assert.Equal(t, v1.ClusterIssuerKind, cert.Spec.IssuerRef.Kind, name)
+		}
+	})
+
+	t.Run("omitting internalIssuerConf leaves every certificate on issuerConf", func(t *testing.T) {
+		cluster := newCluster("split-absent")
+		cluster.Spec.TLS.InternalIssuerConf = nil
+		client, ctrl := setup(t, cluster)
+		ctx := t.Context()
+
+		require.NoError(t, ctrl.ApplyReplicationCertificate(ctx, cluster))
+		require.NoError(t, ctrl.ApplyPGBackRestClientCertificate(ctx, cluster))
+
+		for _, name := range []string{
+			cluster.Name + "-replication-cert",
+			cluster.Name + "-pgbackrest-client-cert",
+		} {
+			cert := getCert(t, client, cluster.Namespace, name)
+			assert.Equal(t, "letsencrypt", cert.Spec.IssuerRef.Name, name)
+			assert.Equal(t, v1.ClusterIssuerKind, cert.Spec.IssuerRef.Kind, name)
+		}
+	})
+
+	t.Run("an existing certificate is migrated to the internal issuer", func(t *testing.T) {
+		// Adding the field to a running cluster has to move the two client
+		// certificates, which is what the issuerRef drift correction is for.
+		cluster := newCluster("split-drift")
+		cluster.Spec.TLS.InternalIssuerConf = nil
+		client, ctrl := setup(t, cluster)
+		ctx := t.Context()
+
+		require.NoError(t, ctrl.ApplyReplicationCertificate(ctx, cluster))
+		before := getCert(t, client, cluster.Namespace, cluster.Name+"-replication-cert")
+		require.Equal(t, "letsencrypt", before.Spec.IssuerRef.Name)
+
+		cluster.Spec.TLS.InternalIssuerConf = &cmmeta.IssuerReference{
+			Name: "postgres-internal", Kind: v1.IssuerKind,
+		}
+		require.NoError(t, ctrl.ApplyReplicationCertificate(ctx, cluster))
+
+		after := getCert(t, client, cluster.Namespace, cluster.Name+"-replication-cert")
+		assert.Equal(t, "postgres-internal", after.Spec.IssuerRef.Name)
+		assert.Equal(t, v1.IssuerKind, after.Spec.IssuerRef.Kind)
 	})
 }

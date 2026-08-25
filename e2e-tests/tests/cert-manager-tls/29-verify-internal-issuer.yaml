@@ -1,0 +1,119 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+  - script: |-
+      set -o errexit
+      set -o xtrace
+
+      source ../../functions
+
+      # The cluster is still on the external ClusterIssuer from step 24. Add a
+      # second, namespaced issuer for the two client identities an ACME issuer
+      # cannot sign: "_crunchyrepl" has an underscore and "pgbackrest@<uid>" an
+      # "@", neither of which is a valid ACME identifier.
+      #
+      # Its CA deliberately uses a different common name from the external one
+      # (cert-manager-tls-ca), so the two CAs are distinguishable and the
+      # following steps prove each side verifies against the right one.
+      internal_issuer_name="postgres-internal"
+      internal_bootstrap_name="${internal_issuer_name}-bootstrap"
+      internal_ca_cert_name="${internal_issuer_name}-ca-cert"
+
+      kubectl -n "$NAMESPACE" apply -f - <<EOF
+      apiVersion: cert-manager.io/v1
+      kind: Issuer
+      metadata:
+        name: ${internal_bootstrap_name}
+      spec:
+        selfSigned: {}
+      EOF
+
+      kubectl -n "$NAMESPACE" apply -f - <<EOF
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+      metadata:
+        name: ${internal_ca_cert_name}
+      spec:
+        isCA: true
+        commonName: cert-manager-tls-internal-ca
+        secretName: ${internal_ca_cert_name}
+        privateKey:
+          algorithm: ECDSA
+          size: 256
+        issuerRef:
+          name: ${internal_bootstrap_name}
+          kind: Issuer
+        duration: 8760h0m0s
+        renewBefore: 720h0m0s
+        usages:
+          - "cert sign"
+          - "crl sign"
+      EOF
+
+      kubectl -n "$NAMESPACE" wait --for=condition=Ready "certificate/${internal_ca_cert_name}" --timeout=60s
+
+      kubectl -n "$NAMESPACE" apply -f - <<EOF
+      apiVersion: cert-manager.io/v1
+      kind: Issuer
+      metadata:
+        name: ${internal_issuer_name}
+      spec:
+        ca:
+          secretName: ${internal_ca_cert_name}
+      EOF
+
+      kubectl -n "$NAMESPACE" wait --for=condition=Ready "issuer/${internal_issuer_name}" --timeout=60s
+
+      kubectl -n "$NAMESPACE" patch perconapgcluster cert-manager-tls \
+        --type=merge \
+        -p="{\"spec\":{\"tls\":{\"internalIssuerConf\":{\"name\":\"${internal_issuer_name}\",\"kind\":\"Issuer\"}}}}"
+      sleep 10
+
+      wait_cluster_consistency cert-manager-tls
+
+      # The operator must not adopt an issuer it did not create.
+      internal_managed_by=$(kubectl -n "$NAMESPACE" get issuer "${internal_issuer_name}" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}')
+      if [[ -n "$internal_managed_by" ]]; then
+          echo "Externally-managed Issuer should not be labeled as operator-managed, got: $internal_managed_by"
+          exit 1
+      fi
+
+      # Exactly the two client identities move to the internal issuer.
+      for cert in cert-manager-tls-replication-cert cert-manager-tls-pgbackrest-client-cert; do
+          kubectl -n "$NAMESPACE" wait --for=condition=Ready "certificate/${cert}" --timeout=120s
+
+          issuer_name=$(kubectl -n "$NAMESPACE" get certificate "$cert" -o jsonpath='{.spec.issuerRef.name}')
+          issuer_kind=$(kubectl -n "$NAMESPACE" get certificate "$cert" -o jsonpath='{.spec.issuerRef.kind}')
+          if [[ "$issuer_name" != "$internal_issuer_name" || "$issuer_kind" != "Issuer" ]]; then
+              echo "$cert should reference the internal Issuer, got name=$issuer_name kind=$issuer_kind"
+              exit 1
+          fi
+      done
+
+      # ...and nothing else does. Server certificates stay on issuerConf.
+      external_issuer_name="${NAMESPACE}-shared-issuer"
+      server_certs="cert-manager-tls-cluster-cert cert-manager-tls-pgbouncer-cert cert-manager-tls-pgbackrest-repo-cert"
+      for sts in $(kubectl -n "$NAMESPACE" get sts \
+        -l postgres-operator.crunchydata.com/cluster=cert-manager-tls,postgres-operator.crunchydata.com/data=postgres \
+        -o jsonpath='{.items[*].metadata.name}'); do
+          server_certs="${server_certs} ${sts}-cert"
+      done
+
+      for cert in $server_certs; do
+          issuer_name=$(kubectl -n "$NAMESPACE" get certificate "$cert" -o jsonpath='{.spec.issuerRef.name}')
+          issuer_kind=$(kubectl -n "$NAMESPACE" get certificate "$cert" -o jsonpath='{.spec.issuerRef.kind}')
+          if [[ "$issuer_name" != "$external_issuer_name" || "$issuer_kind" != "ClusterIssuer" ]]; then
+              echo "$cert should still reference the external ClusterIssuer, got name=$issuer_name kind=$issuer_kind"
+              exit 1
+          fi
+      done
+
+      # The two issuers sign with different CAs, so the merged bundle the
+      # instances mount as ca.crt has to carry both.
+      bundle_cert_count=$(kubectl -n "$NAMESPACE" get secret cert-manager-tls-ca-bundle \
+        -o jsonpath='{.data.ca\.crt}' | base64 -d | grep -c "BEGIN CERTIFICATE")
+      if [[ "$bundle_cert_count" -ne 2 ]]; then
+          echo "CA bundle should contain both issuers' CAs, got $bundle_cert_count certificate(s)"
+          exit 1
+      fi
+    timeout: 420

@@ -67,6 +67,13 @@ spec:
 #      name: some-selfsigned-issuer
 #      kind: ClusterIssuer
 #      group: cert-manager.io
+#    # Issuer for the internal client certificates, `_crunchyrepl` and
+#    # `pgbackrest@<cluster-uid>`. Neither is a valid ACME identifier, so set this
+#    # when issuerConf points at an ACME issuer. Requires issuerConf.
+#    internalIssuerConf:
+#      name: postgres-internal
+#      kind: Issuer
+#      group: cert-manager.io
 #    # Extra CA bundles to trust, each a Secret with a PEM bundle in key `ca.crt`.
 #    # Required when the issuer returns no CA certificate of its own, as ACME
 #    # issuers do: without it there is nothing to verify peers against.

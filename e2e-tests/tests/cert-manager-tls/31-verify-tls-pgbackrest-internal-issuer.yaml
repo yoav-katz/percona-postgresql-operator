@@ -1,0 +1,33 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+  - script: |-
+      set -o errexit
+      set -o xtrace
+
+      source ../../functions
+
+      instance=$(kubectl -n "$NAMESPACE" get pod \
+        -l postgres-operator.crunchydata.com/cluster=cert-manager-tls,postgres-operator.crunchydata.com/role=primary \
+        -o jsonpath='{.items[0].metadata.name}')
+
+      # The pgBackRest server certificate still comes from the external issuer.
+      pgbr_certificate_data=$(run_comand_on_pod "openssl s_client -connect ${instance}.cert-manager-tls-pods:8432 <<< '' 2>/dev/null | openssl x509 -noout -subject -issuer")
+
+      if [[ "$pgbr_certificate_data" != *"issuer=CN=cert-manager-tls-ca"* ]]; then
+          echo "Unexpected pgBackRest server certificate issuer. Expected CN=cert-manager-tls-ca"
+          echo "Got: $pgbr_certificate_data"
+          exit 1
+      fi
+
+      # ...while the client certificate it presents comes from the internal one.
+      client_issuer=$(kubectl -n "$NAMESPACE" exec "$instance" -c pgbackrest -- \
+        openssl x509 -in /etc/pgbackrest/conf.d/~postgres-operator/client-tls.crt -noout -issuer)
+      if [[ "$client_issuer" != *"CN=cert-manager-tls-internal-ca"* ]]; then
+          echo "pgBackRest client certificate should be signed by the internal CA, got: $client_issuer"
+          exit 1
+      fi
+
+      # tls-server-ca-file has to trust both, or this fails.
+      kubectl -n "$NAMESPACE" exec "$instance" -c pgbackrest -- pgbackrest info
+    timeout: 60

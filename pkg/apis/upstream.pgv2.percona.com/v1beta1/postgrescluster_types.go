@@ -311,6 +311,7 @@ type ExtensionsSpec struct {
 	PGTDE PGTDESpec `json:"pg_tde,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!has(self.internalIssuerConf) || has(self.issuerConf)",message="internalIssuerConf requires issuerConf"
 type TLSSpec struct {
 	// +optional
 	CertValidityDuration *metav1.Duration `json:"certValidityDuration,omitempty"`
@@ -323,6 +324,14 @@ type TLSSpec struct {
 	CertManagementPolicy CertManagementPolicy `json:"certManagementPolicy,omitempty"`
 	// +optional
 	IssuerConf *cmmeta.IssuerReference `json:"issuerConf,omitempty"`
+
+	// Issuer for the internal client certificates, "_crunchyrepl" and
+	// "pgbackrest@<cluster-uid>". Neither is a valid ACME identifier, so they need an
+	// issuer that can sign them when issuerConf points at an ACME issuer. Every other
+	// certificate keeps using issuerConf. Only valid together with issuerConf. The
+	// operator never creates this issuer; it must already exist.
+	// +optional
+	InternalIssuerConf *cmmeta.IssuerReference `json:"internalIssuerConf,omitempty"`
 
 	// Additional CA bundles to trust when verifying certificates for this cluster.
 	// Each item is a reference to a Secret that contains a PEM-encoded CA bundle in
@@ -338,6 +347,15 @@ func (s *TLSSpec) GetAdditionalTrustedCAs() []corev1.LocalObjectReference {
 		return nil
 	}
 	return s.AdditionalTrustedCAs
+}
+
+// GetInternalIssuerConf is nil-safe: spec.tls is optional, and the trust-bundle
+// path has to work on a cluster that never set it.
+func (s *TLSSpec) GetInternalIssuerConf() *cmmeta.IssuerReference {
+	if s == nil {
+		return nil
+	}
+	return s.InternalIssuerConf
 }
 
 func (s *TLSSpec) GetCertManagementPolicy() CertManagementPolicy {

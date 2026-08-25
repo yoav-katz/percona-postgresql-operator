@@ -74,6 +74,13 @@ func issuerConf(cluster *v1beta1.PostgresCluster) *cmmeta.IssuerReference {
 	return cluster.Spec.TLS.IssuerConf
 }
 
+func internalIssuerConf(cluster *v1beta1.PostgresCluster) *cmmeta.IssuerReference {
+	if cluster.Spec.TLS == nil {
+		return nil
+	}
+	return cluster.Spec.TLS.InternalIssuerConf
+}
+
 // ResolveIssuerMode determines how the operator should handle cluster.Spec.TLS.IssuerConf.
 func ResolveIssuerMode(ctx context.Context, cl client.Client, cluster *v1beta1.PostgresCluster) (IssuerMode, error) {
 	// Only auto uses cert-manager
@@ -114,7 +121,25 @@ func ResolveIssuerMode(ctx context.Context, cl client.Client, cluster *v1beta1.P
 	}
 }
 
-func issuerRef(cluster *v1beta1.PostgresCluster, mode IssuerMode) cmmeta.IssuerReference {
+// issuerRef is the one place every Certificate resolves its issuer, so the
+// server/client split exists here rather than as a condition at each call site.
+//
+// internalClient selects spec.tls.internalIssuerConf for the two certificates
+// whose identity an ACME issuer cannot sign, "_crunchyrepl" and
+// "pgbackrest@<cluster-uid>". It is reference-only: ResolveIssuerMode and every
+// naming helper stay on issuerConf, so the operator never creates the internal
+// issuer and never names a resource after it.
+func issuerRef(cluster *v1beta1.PostgresCluster, mode IssuerMode, internalClient bool) cmmeta.IssuerReference {
+	if internalClient {
+		if ic := internalIssuerConf(cluster); ic != nil {
+			group := ic.Group
+			if group == "" {
+				group = certmanager.GroupName
+			}
+			return cmmeta.IssuerReference{Name: ic.Name, Kind: ic.Kind, Group: group}
+		}
+	}
+
 	switch mode {
 	case IssuerModeExternal:
 		ic := issuerConf(cluster)
@@ -214,7 +239,7 @@ func (c *controller) ApplyIssuer(ctx context.Context, cluster *v1beta1.PostgresC
 	if mode == IssuerModeManagedCluster {
 		caSecretName := naming.ClusterCACertSecret(cluster, CertManagerNamespace()).Name
 		meta := metav1.ObjectMeta{
-			Name: issuerRef(cluster, mode).Name,
+			Name: issuerRef(cluster, mode, false).Name,
 			Labels: map[string]string{
 				naming.LabelPerconaManagedBy: naming.LabelPerconaManagedByValue,
 			},
@@ -503,7 +528,7 @@ func (c *controller) ApplyClusterCertificate(ctx context.Context, cluster *v1bet
 	if err != nil {
 		return errors.Wrap(err, "failed to resolve issuer mode")
 	}
-	wantIssuerRef := issuerRef(cluster, mode)
+	wantIssuerRef := issuerRef(cluster, mode, false)
 
 	certName := ClusterCertificateName(cluster)
 
@@ -613,7 +638,7 @@ func (c *controller) ApplyInstanceCertificate(ctx context.Context, cluster *v1be
 	if err != nil {
 		return errors.Wrap(err, "failed to resolve issuer mode")
 	}
-	wantIssuerRef := issuerRef(cluster, mode)
+	wantIssuerRef := issuerRef(cluster, mode, false)
 
 	certName := InstanceCertificateName(instanceName)
 	secretName := instanceName + "-certs"
@@ -723,7 +748,7 @@ func (c *controller) ApplyPGBouncerCertificate(ctx context.Context, cluster *v1b
 	if err != nil {
 		return errors.Wrap(err, "failed to resolve issuer mode")
 	}
-	wantIssuerRef := issuerRef(cluster, mode)
+	wantIssuerRef := issuerRef(cluster, mode, false)
 
 	secretMeta := naming.ClusterPGBouncer(cluster)
 	certName := PGBouncerCertificateName(cluster)
@@ -829,7 +854,7 @@ func (c *controller) ApplyReplicationCertificate(ctx context.Context, cluster *v
 	if err != nil {
 		return errors.Wrap(err, "failed to resolve issuer mode")
 	}
-	wantIssuerRef := issuerRef(cluster, mode)
+	wantIssuerRef := issuerRef(cluster, mode, true /* internal client identity */)
 
 	secretMeta := naming.ReplicationClientCertSecret(cluster)
 	certName := ReplicationCertificateName(cluster)
@@ -937,7 +962,7 @@ func (c *controller) ApplyPGBackRestClientCertificate(ctx context.Context, clust
 	if err != nil {
 		return errors.Wrap(err, "failed to resolve issuer mode")
 	}
-	wantIssuerRef := issuerRef(cluster, mode)
+	wantIssuerRef := issuerRef(cluster, mode, true /* internal client identity */)
 
 	secretMeta := naming.PGBackRestClientCertSecret(cluster)
 	certName := PGBackRestClientCertificateName(cluster)
@@ -1055,7 +1080,7 @@ func (c *controller) ApplyPGBackRestRepoCertificate(ctx context.Context, cluster
 	if err != nil {
 		return errors.Wrap(err, "failed to resolve issuer mode")
 	}
-	wantIssuerRef := issuerRef(cluster, mode)
+	wantIssuerRef := issuerRef(cluster, mode, false)
 
 	secretMeta := naming.PGBackRestRepoCertSecret(cluster)
 	certName := PGBackRestRepoCertificateName(cluster)
