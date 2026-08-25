@@ -60,6 +60,9 @@ commands:
 
       # The pgBackRest client Certificate is reissued independently, so wait for
       # its mounted certificate to converge as well.
+      instance=$(kubectl -n "$NAMESPACE" get pod \
+        -l postgres-operator.crunchydata.com/cluster=cert-manager-tls,postgres-operator.crunchydata.com/role=primary \
+        -o jsonpath='{.items[0].metadata.name}')
       pgbackrest_converged=0
       for _ in $(seq 1 40); do
           client_issuer=$(kubectl -n "$NAMESPACE" exec "$instance" -c pgbackrest -- \
