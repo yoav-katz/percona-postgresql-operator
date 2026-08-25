@@ -5,6 +5,7 @@
 package postgrescluster
 
 import (
+	"bytes"
 	"context"
 	"strings"
 
@@ -743,20 +744,6 @@ func (*Reconciler) instanceCertificate(
 func (r *Reconciler) reconcileCABundleSecret(
 	ctx context.Context, cluster *v1beta1.PostgresCluster,
 ) (*corev1.SecretProjection, error) {
-	additionalCAs, err := r.additionalTrustedCAs(ctx, cluster)
-	if err != nil {
-		return nil, err
-	}
-
-	// A separate internal issuer signs the cluster and replication certificates
-	// with different CAs, and each of the two files this Secret feeds has to
-	// verify against both: ssl_ca_file checks the _crunchyrepl client cert
-	// issued by the internal one, while the replication sslrootcert checks the
-	// server cert issued by the other.
-	if len(additionalCAs) == 0 && cluster.Spec.TLS.GetInternalIssuerConf() == nil {
-		return nil, nil
-	}
-
 	// A user-provided Secret is not ours to merge into, and the internal PKI
 	// path writes ca.crt itself, so neither needs this indirection.
 	if cluster.Spec.CustomTLSSecret != nil {
@@ -770,23 +757,51 @@ func (r *Reconciler) reconcileCABundleSecret(
 		return nil, nil
 	}
 
-	// Whatever these files verified before has to keep verifying, so the
-	// issued CAs stay in the bundle alongside the additional ones. Either may
-	// be absent: an ACME issuer writes no ca.crt at all.
-	sources := make([][]byte, 0, 2+len(additionalCAs))
-	for _, meta := range []metav1.ObjectMeta{
-		naming.PostgresTLSSecret(cluster),
-		naming.ReplicationClientCertSecret(cluster),
-	} {
+	additionalCAs, err := r.additionalTrustedCAs(ctx, cluster)
+	if err != nil {
+		return nil, err
+	}
+
+	// Whatever these files verified before has to keep verifying, so the issued
+	// CAs stay in the bundle alongside the additional ones. Either may be
+	// absent: an ACME issuer writes no ca.crt at all.
+	issuedCA := func(meta metav1.ObjectMeta) ([]byte, error) {
 		secret := &corev1.Secret{ObjectMeta: meta}
 		if err := r.Client.Get(ctx, client.ObjectKeyFromObject(secret), secret); err != nil {
 			if !k8serrors.IsNotFound(err) {
 				return nil, errors.Wrapf(err, "get TLS secret %s", secret.Name)
 			}
-			continue
+			return nil, nil
 		}
-		sources = append(sources, secret.Data[rootCertFile])
+		return secret.Data[rootCertFile], nil
 	}
+
+	clusterCA, err := issuedCA(naming.PostgresTLSSecret(cluster))
+	if err != nil {
+		return nil, err
+	}
+	replicationCA, err := issuedCA(naming.ReplicationClientCertSecret(cluster))
+	if err != nil {
+		return nil, err
+	}
+
+	// The two spec checks cover configuring the feature. The divergence check
+	// covers unconfiguring it: cert-manager reissues the client certificate
+	// asynchronously, so for a while after internalIssuerConf is removed the
+	// server and client certificates are still signed by different CAs. Going
+	// by spec alone would drop the merged bundle right then, leaving
+	// ssl_ca_file unable to verify the certificate the client still presents,
+	// and would roll the StatefulSet at exactly that moment.
+	if len(additionalCAs) == 0 &&
+		cluster.Spec.TLS.GetInternalIssuerConf() == nil &&
+		!divergentCAs(clusterCA, replicationCA) {
+		// Only stop projecting the Secret; do not delete it. Pods that have not
+		// rolled yet are still projecting it, and it is garbage-collected with
+		// the cluster anyway.
+		return nil, nil
+	}
+
+	sources := append([][]byte{clusterCA, replicationCA}, additionalCAs...)
 
 	intent := &corev1.Secret{ObjectMeta: naming.PostgresCABundleSecret(cluster)}
 	intent.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Secret"))
@@ -799,7 +814,7 @@ func (r *Reconciler) reconcileCABundleSecret(
 		}, cluster.Name, "", cluster.Labels[naming.LabelVersion]),
 	)
 	intent.Data = map[string][]byte{
-		rootCertFile: pki.TrustBundle(append(sources, additionalCAs...)...),
+		rootCertFile: pki.TrustBundle(sources...),
 	}
 
 	// Unlike the certificate Secrets, which K8SPG-330 deliberately keeps after
@@ -834,6 +849,20 @@ func emptyCABundleError(what string, sources ...[]byte) error {
 	return errors.Errorf(
 		"issuer did not return a CA certificate for %s;"+
 			" set spec.tls.additionalTrustedCAs to supply one", what)
+}
+
+// divergentCAs reports whether two certificates were signed by different CAs
+// and therefore still need a merged trust bundle to verify each other.
+//
+// A certificate that is missing or not yet issued is not divergence. Counting
+// it as such would make the bundle - and with it a source in the instance Pod's
+// certificate volume - appear and disappear while a cluster is still coming up,
+// rolling the StatefulSet for no reason.
+func divergentCAs(a, b []byte) bool {
+	// Compare through TrustBundle so that two encodings of the same CA, one
+	// padded or missing a trailing newline, do not read as different.
+	a, b = pki.TrustBundle(a), pki.TrustBundle(b)
+	return len(a) > 0 && len(b) > 0 && !bytes.Equal(a, b)
 }
 
 // withoutCA returns projection without its ca.crt item. A projected volume

@@ -2443,11 +2443,6 @@ func pgBackRestCACert(
 	rootCA *pki.RootCertificateAuthority, clientSecret, repoSecret *corev1.Secret,
 	additionalCAs [][]byte,
 ) ([]byte, error) {
-	if rootCA != nil && len(additionalCAs) == 0 {
-		caCert, err := rootCA.Certificate.MarshalText()
-		return caCert, errors.Wrap(err, "failed to marshal root CA certificate")
-	}
-
 	var sources [][]byte
 	if rootCA != nil {
 		root, err := rootCA.Certificate.MarshalText()
@@ -2455,14 +2450,17 @@ func pgBackRestCACert(
 			return nil, errors.Wrap(err, "failed to marshal root CA certificate")
 		}
 		sources = append(sources, root)
-	} else {
-		// The client and repo host certificates can come from different
-		// issuers, so take the CA of each rather than the first one found.
-		sources = append(sources,
-			clientSecret.Data[corev1.ServiceAccountRootCAKey],
-			repoSecret.Data[corev1.ServiceAccountRootCAKey],
-		)
 	}
+
+	// The client and repo host certificates can come from different issuers -
+	// spec.tls.internalIssuerConf signs the client one - so take the CA of each
+	// rather than assuming the operator root covers them. TrustBundle drops
+	// duplicates, so when one issuer signs everything this is the single CA it
+	// has always been.
+	sources = append(sources,
+		clientSecret.Data[corev1.ServiceAccountRootCAKey],
+		repoSecret.Data[corev1.ServiceAccountRootCAKey],
+	)
 	sources = append(sources, additionalCAs...)
 
 	if caCert := pki.TrustBundle(sources...); len(caCert) > 0 {

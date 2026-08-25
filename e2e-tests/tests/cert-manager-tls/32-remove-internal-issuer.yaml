@@ -1,0 +1,77 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+commands:
+  - script: |-
+      set -o errexit
+      set -o xtrace
+
+      source ../../functions
+
+      # Removing internalIssuerConf sends the two client certificates back to
+      # issuerConf, but cert-manager reissues them asynchronously. Until it has,
+      # the server and client certificates are still signed by different CAs and
+      # the merged bundle is the only thing letting ssl_ca_file verify the
+      # certificate the client actually presents.
+      #
+      # The assertion is continuity: replication must not drop at any point
+      # during the migration. That only fails when the bundle is released early,
+      # so it cannot be flaky in the other direction.
+      kubectl -n "$NAMESPACE" patch perconapgcluster cert-manager-tls \
+        --type=merge \
+        -p='{"spec":{"tls":{"internalIssuerConf":null}}}'
+
+      external_issuer_name="${NAMESPACE}-shared-issuer"
+
+      check_replication() {
+          local count
+          count=$(run_psql_local \
+            "SELECT count(*) FROM pg_stat_ssl s JOIN pg_stat_replication r ON s.pid = r.pid WHERE s.ssl = true;" \
+            "postgres:$(get_psql_user_pass cert-manager-tls-pguser-postgres)@cert-manager-tls-primary" \
+            | tr -d '[:space:]')
+          if [[ "$count" -lt 1 ]]; then
+              echo "SSL replication was interrupted while the client certificate was being reissued"
+              exit 1
+          fi
+      }
+
+      # Poll until the client certificate has converged onto issuerConf, failing
+      # immediately if replication drops on the way.
+      converged=0
+      for _ in $(seq 1 40); do
+          check_replication
+
+          issuer_name=$(kubectl -n "$NAMESPACE" get certificate cert-manager-tls-replication-cert \
+            -o jsonpath='{.spec.issuerRef.name}')
+          ready=$(kubectl -n "$NAMESPACE" get certificate cert-manager-tls-replication-cert \
+            -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+
+          if [[ "$issuer_name" == "$external_issuer_name" && "$ready" == "True" ]]; then
+              converged=1
+              break
+          fi
+          sleep 5
+      done
+
+      if [[ "$converged" -ne 1 ]]; then
+          echo "Replication certificate did not converge back to ${external_issuer_name}"
+          kubectl -n "$NAMESPACE" get certificate cert-manager-tls-replication-cert -o yaml
+          exit 1
+      fi
+
+      # Both client certificates are back on the external CA.
+      instance=$(kubectl -n "$NAMESPACE" get pod \
+        -l postgres-operator.crunchydata.com/cluster=cert-manager-tls,postgres-operator.crunchydata.com/role=primary \
+        -o jsonpath='{.items[0].metadata.name}')
+
+      client_issuer=$(kubectl -n "$NAMESPACE" exec "$instance" -c pgbackrest -- \
+        openssl x509 -in /etc/pgbackrest/conf.d/~postgres-operator/client-tls.crt -noout -issuer)
+      if [[ "$client_issuer" != *"CN=cert-manager-tls-ca"* ]]; then
+          echo "pgBackRest client certificate did not converge back to the external CA, got: $client_issuer"
+          exit 1
+      fi
+
+      wait_cluster_consistency cert-manager-tls
+
+      check_replication
+      kubectl -n "$NAMESPACE" exec "$instance" -c pgbackrest -- pgbackrest info
+    timeout: 420

@@ -4895,6 +4895,37 @@ func TestPgBackRestCACert(t *testing.T) {
 		assert.DeepEqual(t, caCert, append(append([]byte{}, rootPEM...), extraCA...))
 	})
 
+	t.Run("keeps the internal issuer CA alongside the operator root", func(t *testing.T) {
+		// With spec.tls.internalIssuerConf in a managed issuer mode the operator
+		// still has its own root, but the pgBackRest *client* certificate is
+		// signed by the internal issuer. tls-server-ca-file is the single file
+		// that verifies that client, so dropping its CA in favour of the root
+		// makes every pgBackRest connection fail authentication.
+		root, err := pki.NewRootCertificateAuthority()
+		assert.NilError(t, err)
+		rootPEM, err := root.Certificate.MarshalText()
+		assert.NilError(t, err)
+		internalCA := caPEM(t)
+
+		caCert, err := pgBackRestCACert(root, secretWithCA(internalCA), secretWithCA(rootPEM), nil)
+		assert.NilError(t, err)
+		assert.Equal(t, certCount(caCert), 2)
+		assert.Assert(t, strings.Contains(string(caCert), string(internalCA)),
+			"the internal issuer CA must be present")
+	})
+
+	t.Run("rootCA alone is unchanged when the issued CAs match it", func(t *testing.T) {
+		// The ordinary single-issuer case must stay byte-identical.
+		root, err := pki.NewRootCertificateAuthority()
+		assert.NilError(t, err)
+		rootPEM, err := root.Certificate.MarshalText()
+		assert.NilError(t, err)
+
+		caCert, err := pgBackRestCACert(root, secretWithCA(rootPEM), secretWithCA(rootPEM), nil)
+		assert.NilError(t, err)
+		assert.DeepEqual(t, rootPEM, caCert)
+	})
+
 	t.Run("errors when neither secret has a CA cert", func(t *testing.T) {
 		_, err := pgBackRestCACert(nil, &corev1.Secret{}, &corev1.Secret{}, nil)
 		assert.ErrorContains(t, err, "did not return a CA certificate")

@@ -5,6 +5,7 @@
 package postgrescluster
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -1615,6 +1616,95 @@ func TestReconcileCABundleSecret(t *testing.T) {
 			Namespace: cluster.Namespace, Name: cluster.Name + "-ca-bundle",
 		}, bundle))
 		assert.DeepEqual(t, bundle.Data["ca.crt"], clusterCA)
+	})
+
+	t.Run("RemovalKeepsBundleWhileClientCertLags", func(t *testing.T) {
+		// The regression this guards: internalIssuerConf has just been removed,
+		// but cert-manager has not reissued the _crunchyrepl certificate yet, so
+		// the client certificate on disk is still signed by the internal CA.
+		// Dropping the bundle here would leave ssl_ca_file unable to verify it,
+		// and would roll the StatefulSet at exactly that moment.
+		cluster := newCluster()
+		r := newReconciler(
+			secret(naming.PostgresTLSSecret(cluster), clusterCA),
+			secret(naming.ReplicationClientCertSecret(cluster), replicationCA),
+		)
+
+		projection, err := r.reconcileCABundleSecret(ctx, cluster)
+		assert.NilError(t, err)
+		assert.Assert(t, projection != nil, "bundle dropped before the client certificate converged")
+
+		bundle := new(corev1.Secret)
+		assert.NilError(t, r.Client.Get(ctx, client.ObjectKey{
+			Namespace: cluster.Namespace, Name: cluster.Name + "-ca-bundle",
+		}, bundle))
+		assert.DeepEqual(t, bundle.Data["ca.crt"],
+			append(append([]byte{}, clusterCA...), replicationCA...))
+	})
+
+	t.Run("DeactivatesOnceClientCertConverges", func(t *testing.T) {
+		// cert-manager has now reissued under issuerConf, so both certificates
+		// share one CA and the plain projections are safe again.
+		cluster := newCluster()
+		r := newReconciler(
+			secret(naming.PostgresTLSSecret(cluster), clusterCA),
+			secret(naming.ReplicationClientCertSecret(cluster), clusterCA),
+		)
+
+		projection, err := r.reconcileCABundleSecret(ctx, cluster)
+		assert.NilError(t, err)
+		assert.Assert(t, projection == nil)
+	})
+
+	t.Run("DeactivationLeavesTheSecretInPlace", func(t *testing.T) {
+		// Pods that have not rolled yet are still projecting it; deleting it
+		// here would break their volume.
+		cluster := newCluster()
+		r := newReconciler(
+			secret(naming.PostgresTLSSecret(cluster), clusterCA),
+			secret(naming.ReplicationClientCertSecret(cluster), replicationCA),
+		)
+
+		_, err := r.reconcileCABundleSecret(ctx, cluster)
+		assert.NilError(t, err)
+
+		// The client certificate converges.
+		converged := secret(naming.ReplicationClientCertSecret(cluster), clusterCA)
+		assert.NilError(t, r.Client.Update(ctx, converged))
+
+		projection, err := r.reconcileCABundleSecret(ctx, cluster)
+		assert.NilError(t, err)
+		assert.Assert(t, projection == nil)
+
+		assert.NilError(t, r.Client.Get(ctx, client.ObjectKey{
+			Namespace: cluster.Namespace, Name: cluster.Name + "-ca-bundle",
+		}, new(corev1.Secret)), "the Secret must outlive the projection")
+	})
+
+	t.Run("MissingReplicationSecretIsNotDivergence", func(t *testing.T) {
+		// During initial creation the replication certificate may not exist
+		// yet. Treating that as divergence would add and then remove a volume
+		// source, rolling the StatefulSet for nothing.
+		cluster := newCluster()
+		r := newReconciler(secret(naming.PostgresTLSSecret(cluster), clusterCA))
+
+		projection, err := r.reconcileCABundleSecret(ctx, cluster)
+		assert.NilError(t, err)
+		assert.Assert(t, projection == nil)
+	})
+
+	t.Run("ReEncodedCAIsNotDivergence", func(t *testing.T) {
+		// Same CA, different bytes: no trailing newline and some padding.
+		cluster := newCluster()
+		reEncoded := append([]byte("\n"), bytes.TrimRight(clusterCA, "\n")...)
+		r := newReconciler(
+			secret(naming.PostgresTLSSecret(cluster), clusterCA),
+			secret(naming.ReplicationClientCertSecret(cluster), reEncoded),
+		)
+
+		projection, err := r.reconcileCABundleSecret(ctx, cluster)
+		assert.NilError(t, err)
+		assert.Assert(t, projection == nil)
 	})
 
 	t.Run("DuplicateCAsAreNotRepeated", func(t *testing.T) {
