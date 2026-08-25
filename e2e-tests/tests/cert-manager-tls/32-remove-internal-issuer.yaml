@@ -42,10 +42,10 @@ commands:
 
           issuer_name=$(kubectl -n "$NAMESPACE" get certificate cert-manager-tls-replication-cert \
             -o jsonpath='{.spec.issuerRef.name}')
-          ready=$(kubectl -n "$NAMESPACE" get certificate cert-manager-tls-replication-cert \
-            -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+          replication_issuer=$(kubectl -n "$NAMESPACE" get secret cert-manager-tls-replication-cert \
+            -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -issuer)
 
-          if [[ "$issuer_name" == "$external_issuer_name" && "$ready" == "True" ]]; then
+          if [[ "$issuer_name" == "$external_issuer_name" && "$replication_issuer" == *"CN=cert-manager-tls-ca"* ]]; then
               converged=1
               break
           fi
