@@ -9,7 +9,7 @@ metadata:
 #  - percona.com/delete-ssl
 #  - percona.com/delete-backups
 spec:
-  crVersion: 3.1.0
+  crVersion: 3.2.0
 #  clusterServiceDNSSuffix: cluster.local
 #  initContainer:
 #    image: docker.io/perconalab/percona-postgresql-operator:main
@@ -63,6 +63,9 @@ spec:
 #    certValidityDuration: 2160h
 #    caValidityDuration: 26280h
 #    pgBackRestCertValidityDuration: 2160h
+#    SANs:
+#      - pg.example.com
+#      - "*.pg.internal.example.com"
 #    issuerConf:
 #      name: some-selfsigned-issuer
 #      kind: ClusterIssuer
